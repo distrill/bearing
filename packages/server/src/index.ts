@@ -1,9 +1,10 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { loadConfig, hasGitHubToken, hasLinearKey } from "./config.js";
+import { loadConfig, hasGitHubToken, hasLinearKeys } from "./config.js";
 import { initDb } from "./db.js";
 import { githubRoutes } from "./routes/github.js";
 import { linearRoutes } from "./routes/linear.js";
+import { tagRoutes } from "./routes/tags.js";
 
 const config = loadConfig();
 const db = initDb();
@@ -16,12 +17,13 @@ app.get("/api/health", async () => {
   return {
     status: "ok",
     github: hasGitHubToken(config),
-    linear: hasLinearKey(config),
+    linear: hasLinearKeys(config),
   };
 });
 
 await githubRoutes(app, config);
 await linearRoutes(app, config);
+await tagRoutes(app, db);
 
 try {
   await app.listen({ port: 3001, host: "127.0.0.1" });

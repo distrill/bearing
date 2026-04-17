@@ -1,30 +1,60 @@
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from "fs";
-import { join } from "path";
+import { readFileSync, existsSync } from "fs";
+import { join, dirname } from "path";
 import { homedir } from "os";
 
-export interface BearingConfig {
-  github: { token: string };
-  linear: { apiKey: string };
+export interface SuggestionsConfig {
+  teams?: string[];
+  preferAuthors?: string[];
+  limit?: number;
 }
 
-const CONFIG_DIR = join(homedir(), ".bearing");
-const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+export interface BearingConfig {
+  github: { token: string; suggestions?: SuggestionsConfig };
+  linear: { apiKeys: string[] };
+}
 
 const EMPTY_CONFIG: BearingConfig = {
   github: { token: "" },
-  linear: { apiKey: "" },
+  linear: { apiKeys: [] },
 };
 
+function findProjectRoot(): string | null {
+  let dir = process.cwd();
+  while (true) {
+    if (existsSync(join(dir, "pnpm-workspace.yaml"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function findConfigPath(): string | null {
+  // Check project root first
+  const root = findProjectRoot();
+  if (root) {
+    const projectConfig = join(root, "config.json");
+    if (existsSync(projectConfig)) return projectConfig;
+  }
+
+  // Fall back to ~/.bearing/config.json
+  const homeConfig = join(homedir(), ".bearing", "config.json");
+  if (existsSync(homeConfig)) return homeConfig;
+
+  return null;
+}
+
 export function loadConfig(): BearingConfig {
-  if (!existsSync(CONFIG_PATH)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-    writeFileSync(CONFIG_PATH, JSON.stringify(EMPTY_CONFIG, null, 2) + "\n");
-    console.log(`Created config file at ${CONFIG_PATH}`);
-    console.log("Add your GitHub token and Linear API key to get started.");
+  const configPath = findConfigPath();
+
+  if (!configPath) {
+    console.log(
+      "No config.json found. Create one in the project root or ~/.bearing/config.json",
+    );
     return EMPTY_CONFIG;
   }
 
-  const raw = readFileSync(CONFIG_PATH, "utf-8");
+  console.log(`Loading config from ${configPath}`);
+  const raw = readFileSync(configPath, "utf-8");
   return JSON.parse(raw) as BearingConfig;
 }
 
@@ -32,6 +62,6 @@ export function hasGitHubToken(config: BearingConfig): boolean {
   return config.github.token.length > 0;
 }
 
-export function hasLinearKey(config: BearingConfig): boolean {
-  return config.linear.apiKey.length > 0;
+export function hasLinearKeys(config: BearingConfig): boolean {
+  return config.linear.apiKeys.length > 0;
 }

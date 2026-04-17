@@ -9,6 +9,7 @@ export interface LinearIssue {
   assignee: LinearUser | null;
   createdAt: string;
   updatedAt: string;
+  workspace: string;
   teamName: string;
   teamKey: string;
   labels: LinearLabel[];
