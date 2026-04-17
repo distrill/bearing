@@ -129,6 +129,15 @@ function useLastTouched() {
     return new Date(updatedAt).getTime() > touched;
   }, [map]);
 
+  useEffect(() => {
+    function handleReset() {
+      localStorage.removeItem(key);
+      setMap(new Map());
+    }
+    window.addEventListener("bearing:resetAttention", handleReset);
+    return () => window.removeEventListener("bearing:resetAttention", handleReset);
+  }, []);
+
   return { touch, needsAttention };
 }
 
@@ -150,9 +159,13 @@ function usePersistedBool(key: string, fallback: boolean): [boolean, (next: bool
 interface DashboardProps {
   refreshKey?: number;
   tags?: TagDefinition[];
+  issueSearch: string;
+  prSearch: string;
+  onClearIssueSearch: () => void;
+  onClearPrSearch: () => void;
 }
 
-export function Dashboard({ refreshKey = 0, tags = [] }: DashboardProps) {
+export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, onClearIssueSearch, onClearPrSearch }: DashboardProps) {
   const [reviewPrs, setReviewPrs] = useState<PullRequest[]>([]);
   const [authoredPrs, setAuthoredPrs] = useState<PullRequest[]>([]);
   const [suggestedPrs, setSuggestedPrs] = useState<PullRequest[]>([]);
@@ -320,6 +333,10 @@ export function Dashboard({ refreshKey = 0, tags = [] }: DashboardProps) {
   // Apply filters
   const untaggedActive = filterTags.has("__untagged__");
   let filteredPrs = allPrs;
+  if (prSearch) {
+    const q = prSearch.toLowerCase();
+    filteredPrs = filteredPrs.filter((pr) => pr.title.toLowerCase().includes(q));
+  }
   if (tags.length > 0)
     filteredPrs = filteredPrs.filter((pr) => {
       const t = prTagMap.get(prKey(pr));
@@ -332,6 +349,10 @@ export function Dashboard({ refreshKey = 0, tags = [] }: DashboardProps) {
     filteredPrs = filteredPrs.filter((pr) => needsAttention(prKey(pr), pr.updatedAt));
 
   let filteredIssues = issues;
+  if (issueSearch) {
+    const q = issueSearch.toLowerCase();
+    filteredIssues = filteredIssues.filter((i) => i.title.toLowerCase().includes(q));
+  }
   if (tags.length > 0)
     filteredIssues = filteredIssues.filter((i) => {
       const t = issueTagMap.get(i.id);
@@ -342,6 +363,12 @@ export function Dashboard({ refreshKey = 0, tags = [] }: DashboardProps) {
   filteredIssues = filteredIssues.filter((i) => filterStatuses.has(i.status.name));
   if (untouchedOnly)
     filteredIssues = filteredIssues.filter((i) => needsAttention(i.id, i.updatedAt));
+  filteredIssues.sort((a, b) => {
+    const aTerminal = TERMINAL_TYPES.has(a.status.type);
+    const bTerminal = TERMINAL_TYPES.has(b.status.type);
+    if (aTerminal !== bTerminal) return aTerminal ? 1 : -1;
+    return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  });
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -391,9 +418,10 @@ export function Dashboard({ refreshKey = 0, tags = [] }: DashboardProps) {
               untagged
             </button>
           )}
+          <span className="flex-1" />
           <button
             onClick={() => setUntouchedOnly(!untouchedOnly)}
-            className={`ml-auto text-[10px] font-mono ${untouchedOnly ? "text-bearing-accent" : "text-bearing-muted"}`}
+            className={`text-[10px] font-mono ${untouchedOnly ? "text-bearing-accent" : "text-bearing-muted"}`}
           >
             needs attention
           </button>
@@ -406,6 +434,9 @@ export function Dashboard({ refreshKey = 0, tags = [] }: DashboardProps) {
           <div className="flex items-center px-4 h-9 border-b border-bearing-border">
             <span className="text-xs font-mono text-bearing-muted">issues</span>
             <div className="ml-auto flex items-center gap-2">
+              {issueSearch && (
+                <SearchChip term={issueSearch} onClear={onClearIssueSearch} />
+              )}
               {statuses.length > 1 && (
                 <MultiSelect
                   label="statuses"
@@ -476,6 +507,9 @@ export function Dashboard({ refreshKey = 0, tags = [] }: DashboardProps) {
               pull requests
             </span>
             <div className="ml-auto flex items-center gap-2">
+              {prSearch && (
+                <SearchChip term={prSearch} onClear={onClearPrSearch} />
+              )}
               {prStatuses.length > 1 && (
                 <MultiSelect
                   label="statuses"
@@ -905,6 +939,17 @@ function PrStatusTag({ status }: { status: string }) {
   return <Tag text={status} variant={config[status]} />;
 }
 
+function SearchChip({ term, onClear }: { term: string; onClear: () => void }) {
+  return (
+    <button
+      onClick={onClear}
+      className="text-xs font-mono leading-none text-bearing-accent hover:text-bearing-text"
+    >
+      ["{term}" x]
+    </button>
+  );
+}
+
 function Loading() {
   return (
     <div className="flex items-center justify-center h-32 text-bearing-muted text-xs font-mono">
@@ -950,7 +995,7 @@ function MultiSelect({
     <div ref={ref} className="relative flex items-center">
       <button
         onClick={() => setOpen((o) => !o)}
-        className={`text-xs font-mono leading-none ${selected.size > 0 ? "text-bearing-accent" : "text-bearing-muted hover:text-bearing-text"
+        className={`text-xs font-mono leading-none hover:text-bearing-text ${selected.size > 0 ? "text-bearing-accent" : "text-bearing-muted"
           }`}
       >
         [{label}{selected.size > 0 ? ` ${selected.size}/${options.length}` : ""}]

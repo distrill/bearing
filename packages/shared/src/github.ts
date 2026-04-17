@@ -40,15 +40,41 @@ export interface ReviewComment {
   body: string;
   path: string;
   line: number | null;
+  side: "LEFT" | "RIGHT";
   author: GitHubUser;
   createdAt: string;
   updatedAt: string;
+  inReplyToId: number | null;
 }
 
 export interface PullRequestReview {
   id: number;
-  state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "PENDING";
+  state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "PENDING" | "DISMISSED";
   body: string;
   author: GitHubUser;
   submittedAt: string;
+}
+
+export interface PullRequestCommit {
+  sha: string;
+  message: string;
+  author: GitHubUser;
+  committedAt: string;
+}
+
+export interface IssueComment {
+  id: number;
+  body: string;
+  author: GitHubUser;
+  createdAt: string;
+}
+
+export interface PullRequestFile {
+  sha: string;
+  filename: string;
+  status: "added" | "removed" | "modified" | "renamed" | "copied" | "changed" | "unchanged";
+  additions: number;
+  deletions: number;
+  patch?: string;
+  previousFilename?: string;
 }

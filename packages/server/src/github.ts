@@ -2,6 +2,7 @@ import type {
   PullRequest,
   GitHubUser,
   ReviewDecision,
+  PRDetailResponse,
 } from "@bearing/shared";
 import type { SuggestionsConfig } from "./config.js";
 
@@ -271,4 +272,161 @@ export async function getSuggestedPRs(
   scored.sort((a, b) => b.score - a.score);
 
   return scored.slice(0, limit).map((s) => s.pr);
+}
+
+// --- REST API for PR detail ---
+
+async function restGet<T>(token: string, path: string): Promise<T> {
+  const res = await fetch(`https://api.github.com${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.v3+json",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`GitHub REST API error: ${res.status} ${res.statusText}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+interface RawRestPR {
+  title: string;
+  number: number;
+  body: string | null;
+  state: string;
+  draft: boolean;
+  merged: boolean;
+  html_url: string;
+  user: { login: string; avatar_url: string };
+  created_at: string;
+  updated_at: string;
+  additions: number;
+  deletions: number;
+  changed_files: number;
+}
+
+interface RawRestFile {
+  sha: string;
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch?: string;
+  previous_filename?: string;
+}
+
+interface RawRestReview {
+  id: number;
+  state: string;
+  body: string | null;
+  user: { login: string; avatar_url: string };
+  submitted_at: string;
+}
+
+interface RawRestComment {
+  id: number;
+  body: string;
+  path: string;
+  line: number | null;
+  original_line: number | null;
+  side: string | null;
+  user: { login: string; avatar_url: string };
+  created_at: string;
+  updated_at: string;
+  in_reply_to_id?: number;
+}
+
+interface RawRestCommit {
+  sha: string;
+  commit: {
+    message: string;
+    author: { date: string };
+  };
+  author: { login: string; avatar_url: string } | null;
+}
+
+interface RawRestIssueComment {
+  id: number;
+  body: string;
+  user: { login: string; avatar_url: string };
+  created_at: string;
+}
+
+export async function getPRDetail(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PRDetailResponse> {
+  const base = `/repos/${owner}/${repo}/pulls/${number}`;
+
+  const [pr, files, reviews, comments, issueComments, commits] = await Promise.all([
+    restGet<RawRestPR>(token, base),
+    restGet<RawRestFile[]>(token, `${base}/files?per_page=100`),
+    restGet<RawRestReview[]>(token, `${base}/reviews`),
+    restGet<RawRestComment[]>(token, `${base}/comments?per_page=100`),
+    restGet<RawRestIssueComment[]>(
+      token,
+      `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`,
+    ),
+    restGet<RawRestCommit[]>(token, `${base}/commits?per_page=100`),
+  ]);
+
+  return {
+    title: pr.title,
+    number: pr.number,
+    body: pr.body ?? "",
+    state: pr.merged ? "merged" : (pr.state as "open" | "closed"),
+    draft: pr.draft,
+    htmlUrl: pr.html_url,
+    author: { login: pr.user.login, avatarUrl: pr.user.avatar_url },
+    owner,
+    repo,
+    createdAt: pr.created_at,
+    updatedAt: pr.updated_at,
+    additions: pr.additions,
+    deletions: pr.deletions,
+    changedFiles: pr.changed_files,
+    files: files.map((f) => ({
+      sha: f.sha,
+      filename: f.filename,
+      status: f.status as PRDetailResponse["files"][number]["status"],
+      additions: f.additions,
+      deletions: f.deletions,
+      patch: f.patch,
+      previousFilename: f.previous_filename,
+    })),
+    reviews: reviews.map((r) => ({
+      id: r.id,
+      state: r.state as PRDetailResponse["reviews"][number]["state"],
+      body: r.body ?? "",
+      author: { login: r.user.login, avatarUrl: r.user.avatar_url },
+      submittedAt: r.submitted_at,
+    })),
+    comments: comments.map((c) => ({
+      id: c.id,
+      body: c.body,
+      path: c.path,
+      line: c.line ?? c.original_line ?? null,
+      side: (c.side as "LEFT" | "RIGHT") ?? "RIGHT",
+      author: { login: c.user.login, avatarUrl: c.user.avatar_url },
+      createdAt: c.created_at,
+      updatedAt: c.updated_at,
+      inReplyToId: c.in_reply_to_id ?? null,
+    })),
+    issueComments: issueComments.map((c) => ({
+      id: c.id,
+      body: c.body,
+      author: { login: c.user.login, avatarUrl: c.user.avatar_url },
+      createdAt: c.created_at,
+    })),
+    commits: commits.map((c) => ({
+      sha: c.sha,
+      message: c.commit.message,
+      author: c.author
+        ? { login: c.author.login, avatarUrl: c.author.avatar_url }
+        : { login: "unknown", avatarUrl: "" },
+      committedAt: c.commit.author.date,
+    })),
+  };
 }

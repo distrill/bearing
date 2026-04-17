@@ -1,4 +1,4 @@
-import type { PullRequestsResponse, LinearIssuesResponse, LinearStatus } from "@bearing/shared";
+import type { PullRequestsResponse, LinearIssuesResponse, LinearStatus, LinearTeam, LinearIssue, PRDetailResponse } from "@bearing/shared";
 import type { GitHubUser } from "@bearing/shared";
 
 async function get<T>(path: string): Promise<T> {
@@ -37,6 +37,12 @@ async function del<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export function fetchPRDetail(owner: string, repo: string, number: number) {
+  return get<PRDetailResponse>(
+    `/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/detail`,
+  );
+}
+
 export function fetchPRs(filter: "review_requested" | "authored" | "suggested", refresh = false) {
   const params = new URLSearchParams({ filter });
   if (refresh) params.set("refresh", "1");
@@ -64,6 +70,14 @@ export function fetchWorkflowStates(teamKey: string) {
 
 export function updateIssueStatus(issueId: string, stateId: string) {
   return patch<{ status: LinearStatus }>(`/api/issues/${encodeURIComponent(issueId)}/status`, { stateId });
+}
+
+export function fetchTeams() {
+  return get<{ teams: LinearTeam[] }>("/api/teams");
+}
+
+export function createLinearIssue(teamId: string, title: string) {
+  return post<{ issue: LinearIssue }>("/api/issues", { teamId, title });
 }
 
 export function fetchViewer() {
