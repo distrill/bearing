@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { BearingConfig } from "../config.js";
-import { searchPRs, getSuggestedPRs, getViewer, getPRDetail } from "../github.js";
+import { searchPRs, getSuggestedPRs, getViewer, getPRDetail, submitReview } from "../github.js";
 import { cached, invalidatePrefix } from "../cache.js";
 
 export async function githubRoutes(
@@ -70,6 +70,41 @@ export async function githubRoutes(
     );
 
     return detail;
+  });
+
+  app.post("/api/prs/:owner/:repo/:number/review", async (request, reply) => {
+    if (!config.github.token) {
+      return reply.code(503).send({ error: "GitHub token not configured" });
+    }
+
+    const { owner, repo, number } = request.params as {
+      owner: string;
+      repo: string;
+      number: string;
+    };
+    const { body, event, comments } = request.body as {
+      body: string;
+      event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+      comments?: Array<{ path: string; line: number; side: "LEFT" | "RIGHT"; body: string }>;
+    };
+
+    if (!["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(event)) {
+      return reply.code(400).send({ error: "Invalid event type" });
+    }
+
+    await submitReview(
+      config.github.token,
+      owner,
+      repo,
+      parseInt(number, 10),
+      body,
+      event,
+      comments,
+    );
+
+    invalidatePrefix(`pr-detail:${owner}/${repo}#${number}`);
+
+    return { ok: true };
   });
 
   app.get("/api/github-image", async (request, reply) => {

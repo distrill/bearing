@@ -43,6 +43,20 @@ export function fetchPRDetail(owner: string, repo: string, number: number) {
   );
 }
 
+export function submitReview(
+  owner: string,
+  repo: string,
+  number: number,
+  body: string,
+  event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+  comments?: Array<{ path: string; line: number; side: "LEFT" | "RIGHT"; body: string }>,
+) {
+  return post<{ ok: boolean }>(
+    `/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/review`,
+    { body, event, comments },
+  );
+}
+
 export function fetchPRs(filter: "review_requested" | "authored" | "suggested", refresh = false) {
   const params = new URLSearchParams({ filter });
   if (refresh) params.set("refresh", "1");

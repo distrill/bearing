@@ -9,6 +9,11 @@
   }
 }
 
+.bearing-highlighted {
+  border-color: #9ccfd8 !important;
+  box-shadow: 0 0 0 1px rgba(156, 207, 216, 0.3);
+}
+
 .prose-bearing {
   color: #e0def4;
   font-family: inherit;
@@ -66,11 +71,14 @@
   border-top: 1px solid #403d52;
   margin: 1em 0;
 }
-.prose-bearing img { max-width: 100%; border-radius: 0.375rem; }
+.prose-bearing img { max-width: 100%; border-radius: 0.375rem; display: inline; vertical-align: middle; }
+.prose-bearing h1 img, .prose-bearing h2 img, .prose-bearing h3 img { max-height: 20px; }
 .prose-bearing table {
   width: 100%;
   border-collapse: collapse;
   margin: 0.75em 0;
+  table-layout: fixed;
+  word-break: break-word;
 }
 .prose-bearing th, .prose-bearing td {
   border: 1px solid #403d52;

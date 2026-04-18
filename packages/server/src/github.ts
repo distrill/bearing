@@ -196,17 +196,57 @@ export async function searchPRs(
   token: string,
   filter: "review_requested" | "authored",
 ): Promise<PullRequest[]> {
-  const qualifier =
-    filter === "review_requested"
-      ? "type:pr state:open review-requested:@me"
-      : "type:pr state:open author:@me";
+  if (filter === "review_requested") {
+    const [requested, reviewed] = await Promise.all([
+      graphql<SearchResult>(token, PR_SEARCH_QUERY, {
+        query: "type:pr state:open review-requested:@me",
+        first: 50,
+      }),
+      graphql<SearchResult>(token, PR_SEARCH_QUERY, {
+        query: "type:pr state:open reviewed-by:@me -author:@me",
+        first: 30,
+      }),
+    ]);
 
-  const data = await graphql<SearchResult>(token, PR_SEARCH_QUERY, {
-    query: qualifier,
-    first: 50,
-  });
+    const seen = new Set<number>();
+    const prs: PullRequest[] = [];
+    for (const raw of [...requested.search.nodes, ...reviewed.search.nodes]) {
+      const pr = toPullRequest(raw);
+      if (!seen.has(pr.id)) {
+        seen.add(pr.id);
+        prs.push(pr);
+      }
+    }
+    prs.sort(
+      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+    );
+    return prs;
+  }
 
-  const prs = data.search.nodes.map(toPullRequest);
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+
+  const [openData, recentData] = await Promise.all([
+    graphql<SearchResult>(token, PR_SEARCH_QUERY, {
+      query: "type:pr state:open author:@me",
+      first: 50,
+    }),
+    graphql<SearchResult>(token, PR_SEARCH_QUERY, {
+      query: `type:pr author:@me -state:open updated:>${cutoff}`,
+      first: 20,
+    }),
+  ]);
+
+  const seen = new Set<number>();
+  const prs: PullRequest[] = [];
+  for (const raw of [...openData.search.nodes, ...recentData.search.nodes]) {
+    const pr = toPullRequest(raw);
+    if (!seen.has(pr.id)) {
+      seen.add(pr.id);
+      prs.push(pr);
+    }
+  }
   prs.sort(
     (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
   );
@@ -289,6 +329,46 @@ async function restGet<T>(token: string, path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function restPost<T>(token: string, path: string, body: unknown): Promise<T> {
+  const res = await fetch(`https://api.github.com${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.v3+json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub REST API error: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export interface InlineCommentPayload {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+  body: string;
+}
+
+export async function submitReview(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+  body: string,
+  event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+  comments?: InlineCommentPayload[],
+): Promise<void> {
+  await restPost(token, `/repos/${owner}/${repo}/pulls/${number}/reviews`, {
+    body,
+    event,
+    ...(comments && comments.length > 0 ? { comments } : {}),
+  });
+}
+
 interface RawRestPR {
   title: string;
   number: number;
@@ -334,6 +414,7 @@ interface RawRestComment {
   created_at: string;
   updated_at: string;
   in_reply_to_id?: number;
+  pull_request_review_id?: number;
 }
 
 interface RawRestCommit {
@@ -413,6 +494,7 @@ export async function getPRDetail(
       createdAt: c.created_at,
       updatedAt: c.updated_at,
       inReplyToId: c.in_reply_to_id ?? null,
+      reviewId: c.pull_request_review_id ?? null,
     })),
     issueComments: issueComments.map((c) => ({
       id: c.id,
