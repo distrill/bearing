@@ -416,6 +416,130 @@ export async function fetchCompletedIssuesForStats(
   return results.flat().filter((i) => teamSet.has(i.team.key));
 }
 
+const ISSUES_FOR_REPORT_QUERY = `
+query($first: Int!, $completedAfter: DateTimeOrDuration!, $completedBefore: DateTimeOrDuration!) {
+  issues(
+    first: $first
+    filter: {
+      assignee: { isMe: { eq: true } }
+      completedAt: { gte: $completedAfter, lte: $completedBefore }
+    }
+  ) {
+    nodes {
+      id
+      identifier
+      title
+      completedAt
+      team { key name }
+      labels { nodes { name } }
+      state { name type }
+    }
+  }
+}
+`;
+
+const CREATED_ISSUES_QUERY = `
+query($first: Int!, $createdAfter: DateTimeOrDuration!, $createdBefore: DateTimeOrDuration!) {
+  issues(
+    first: $first
+    filter: {
+      creator: { isMe: { eq: true } }
+      createdAt: { gte: $createdAfter, lte: $createdBefore }
+    }
+  ) {
+    nodes {
+      id
+      identifier
+      title
+      createdAt
+      team { key name }
+      labels { nodes { name } }
+      state { name type }
+    }
+  }
+}
+`;
+
+export interface ReportIssue {
+  identifier: string;
+  title: string;
+  teamName: string;
+  labels: string[];
+  stateName: string;
+}
+
+interface ReportIssueRaw {
+  id: string;
+  identifier: string;
+  title: string;
+  completedAt?: string;
+  createdAt?: string;
+  team: { key: string; name: string };
+  labels: { nodes: Array<{ name: string }> };
+  state: { name: string; type: string };
+}
+
+export async function fetchIssuesForReport(
+  apiKeys: string[],
+  teamKeys: string[],
+  weekStart: string,
+  weekEnd: string,
+): Promise<{ completed: ReportIssue[]; created: ReportIssue[] }> {
+  const teamSet = new Set(teamKeys);
+
+  const results = await Promise.all(
+    apiKeys.map(async (key) => {
+      const [completedData, createdData] = await Promise.all([
+        graphql<{ issues: { nodes: ReportIssueRaw[] } }>(
+          key,
+          ISSUES_FOR_REPORT_QUERY,
+          { first: 100, completedAfter: weekStart, completedBefore: weekEnd + "T23:59:59Z" },
+        ),
+        graphql<{ issues: { nodes: ReportIssueRaw[] } }>(
+          key,
+          CREATED_ISSUES_QUERY,
+          { first: 100, createdAfter: weekStart, createdBefore: weekEnd + "T23:59:59Z" },
+        ),
+      ]);
+      return {
+        completed: completedData.issues.nodes.filter((i) => teamSet.has(i.team.key)),
+        created: createdData.issues.nodes.filter((i) => teamSet.has(i.team.key)),
+      };
+    }),
+  );
+
+  const toReportIssue = (raw: ReportIssueRaw): ReportIssue => ({
+    identifier: raw.identifier,
+    title: raw.title,
+    teamName: raw.team.name,
+    labels: raw.labels.nodes.map((l) => l.name),
+    stateName: raw.state.name,
+  });
+
+  const seenCompleted = new Set<string>();
+  const seenCreated = new Set<string>();
+
+  const completed: ReportIssue[] = [];
+  const created: ReportIssue[] = [];
+
+  for (const r of results) {
+    for (const i of r.completed) {
+      if (!seenCompleted.has(i.id)) {
+        seenCompleted.add(i.id);
+        completed.push(toReportIssue(i));
+      }
+    }
+    for (const i of r.created) {
+      if (!seenCreated.has(i.id)) {
+        seenCreated.add(i.id);
+        created.push(toReportIssue(i));
+      }
+    }
+  }
+
+  return { completed, created };
+}
+
 export async function fetchAllIssues(apiKeys: string[]): Promise<LinearIssue[]> {
   const results = await Promise.all(apiKeys.map(fetchIssuesForKey));
   const issues = results.flat();

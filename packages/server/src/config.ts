@@ -11,11 +11,13 @@ export interface SuggestionsConfig {
 export interface BearingConfig {
   github: { token: string; suggestions?: SuggestionsConfig };
   linear: { apiKeys: string[] };
+  anthropic: { token: string };
 }
 
 const EMPTY_CONFIG: BearingConfig = {
   github: { token: "" },
   linear: { apiKeys: [] },
+  anthropic: { token: "" },
 };
 
 function findProjectRoot(): string | null {

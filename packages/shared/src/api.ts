@@ -55,6 +55,25 @@ export interface StatsResponse {
   issuesClosed: number[];
 }
 
+// GET /api/reports
+export interface WeeklyReport {
+  weekStart: string;
+  content: string;
+  generatedAt: string;
+  stats: {
+    prsOpened: number;
+    prsMerged: number;
+    prsReviewed: number;
+    linesAuthored: number;
+    issuesClosed: number;
+  } | null;
+}
+
+// GET /api/reports
+export interface ReportsListResponse {
+  reports: WeeklyReport[];
+}
+
 // GET /api/health
 export interface HealthResponse {
   status: "ok";

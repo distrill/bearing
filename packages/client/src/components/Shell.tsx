@@ -3,14 +3,17 @@ import { createPortal } from "react-dom";
 import { useLocation } from "wouter";
 import type { LinearTeam, StatsResponse } from "@bearing/shared";
 import type { TagDefinition } from "../lib/api";
-import { createTag, updateTag, deleteTag, fetchTeams, createLinearIssue, fetchRepos, fetchStats } from "../lib/api";
+import { createTag, updateTag, deleteTag, fetchTeams, createLinearIssue, fetchRepos, fetchStats, fetchReports, saveReport, generateReport } from "../lib/api";
+import type { WeeklyReport } from "@bearing/shared";
+import MarkdownBase from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 function fuzzyMatch(query: string, text: string): boolean {
   const t = text.toLowerCase();
   return query.toLowerCase().split(/\s+/).filter(Boolean).every((word) => t.includes(word));
 }
 
-type ShelfTab = "overview" | "tags" | "settings";
+type ShelfTab = "overview" | "tags" | "settings" | "reports";
 
 interface ShellProps {
   children: ReactNode;
@@ -123,7 +126,7 @@ export function Shell({ children, onRefresh, tags = [], onTagsChange, onIssueCre
             <div className="h-full border-t border-x border-bearing-border rounded-t-lg bg-bearing-surface/90 backdrop-blur-sm flex flex-col">
               <div className="max-w-5xl mx-auto w-full flex flex-col flex-1 overflow-hidden my-3 border border-bearing-border rounded-lg">
                 <div className="px-4 pt-3 pb-2 shrink-0 flex items-center gap-4 border-b border-bearing-border">
-                  {(["overview", "tags", "settings"] as const).map((tab) => (
+                  {(["overview", "reports", "tags", "settings"] as const).map((tab) => (
                     <button
                       key={tab}
                       onClick={() => setShelfTab(tab)}
@@ -139,6 +142,7 @@ export function Shell({ children, onRefresh, tags = [], onTagsChange, onIssueCre
                 </div>
                 <div className="flex-1 overflow-y-auto px-4 pt-3 pb-4">
                   {shelfTab === "overview" && <OverviewPane />}
+                  {shelfTab === "reports" && <ReportsPane />}
                   {shelfTab === "tags" && <TagsPane tags={tags} onTagsChange={onTagsChange} />}
                   {shelfTab === "settings" && <SettingsPane teams={teams} />}
                 </div>
@@ -267,6 +271,394 @@ function OverviewPane() {
       )}
     </div>
   );
+}
+
+// --- Reports ---
+
+function getMonday(d: Date): Date {
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  const mon = new Date(d);
+  mon.setDate(diff);
+  mon.setHours(0, 0, 0, 0);
+  return mon;
+}
+
+function formatWeekDate(iso: string): string {
+  const d = new Date(iso + "T00:00:00");
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function generateWeeks(count: number): string[] {
+  const weeks: string[] = [];
+  const now = new Date();
+  const currentMonday = getMonday(now);
+  for (let i = 0; i < count; i++) {
+    const d = new Date(currentMonday);
+    d.setDate(d.getDate() - i * 7);
+    weeks.push(d.toISOString().slice(0, 10));
+  }
+  return weeks;
+}
+
+type ReportView = "view" | "edit" | "diff";
+
+function ReportsPane() {
+  const [selectedWeek, setSelectedWeek] = useState<string>(() => generateWeeks(1)[0]);
+  const [weeksToShow, setWeeksToShow] = useState(12);
+  const [viewMode, setViewMode] = useState<ReportView>("view");
+  const [editContent, setEditContent] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [pendingReport, setPendingReport] = useState<WeeklyReport | null>(null);
+  const [reports, setReports] = useState<Map<string, WeeklyReport>>(new Map());
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    fetchReports()
+      .then((r) => {
+        setReports(new Map(r.reports.map((rpt) => [rpt.weekStart, rpt])));
+      })
+      .catch(() => {})
+      .finally(() => setLoaded(true));
+  }, []);
+
+  const weeks = generateWeeks(weeksToShow);
+  const selectedReport = reports.get(selectedWeek);
+
+  const maxActivity = Math.max(
+    ...[...reports.values()].map((r) => {
+      if (!r.stats) return 0;
+      const s = r.stats;
+      return s.prsOpened + s.prsMerged + s.prsReviewed + s.issuesClosed;
+    }),
+    1,
+  );
+
+  const repos = JSON.parse(localStorage.getItem("bearing:statsRepos") ?? "[]") as string[];
+  const teams = JSON.parse(localStorage.getItem("bearing:statsTeams") ?? "[]") as string[];
+
+  const handleGenerate = async () => {
+    const hasExisting = !!selectedReport;
+    setGenerating(true);
+    try {
+      const report = await generateReport(selectedWeek, repos, teams, hasExisting);
+      if (hasExisting) {
+        setPendingReport(report);
+        setViewMode("diff");
+      } else {
+        setReports((prev) => new Map(prev).set(selectedWeek, report));
+      }
+    } catch {
+      // TODO: surface error
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleAcceptGenerated = async () => {
+    if (!pendingReport) return;
+    await saveReport(selectedWeek, pendingReport.content, pendingReport.stats);
+    setReports((prev) => new Map(prev).set(selectedWeek, pendingReport));
+    setPendingReport(null);
+    setViewMode("view");
+  };
+
+  const handleDiscardGenerated = () => {
+    setPendingReport(null);
+    setViewMode("view");
+  };
+
+  const handleEdit = () => {
+    setEditContent(selectedReport?.content ?? "");
+    setViewMode("edit");
+  };
+
+  const handleSave = async () => {
+    await saveReport(selectedWeek, editContent, selectedReport?.stats);
+    setReports((prev) => {
+      const next = new Map(prev);
+      const existing = next.get(selectedWeek);
+      next.set(selectedWeek, {
+        weekStart: selectedWeek,
+        content: editContent,
+        generatedAt: existing?.generatedAt ?? new Date().toISOString(),
+        stats: existing?.stats ?? null,
+      });
+      return next;
+    });
+    setViewMode("view");
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Week grid */}
+      <div className="shrink-0 pb-3 border-b border-bearing-border mb-3">
+        <div className="flex items-end gap-1 overflow-x-auto">
+          <button
+            onClick={() => setWeeksToShow((w) => w + 12)}
+            className="text-[10px] font-mono text-bearing-muted hover:text-bearing-text shrink-0 px-1 pb-0.5"
+          >
+            ←
+          </button>
+          {[...weeks].reverse().map((week) => {
+            const report = reports.get(week);
+            const isSelected = week === selectedWeek;
+            const isCurrent = week === weeks[0];
+
+            let heat = 0;
+            if (report?.stats) {
+              const s = report.stats;
+              const total = s.prsOpened + s.prsMerged + s.prsReviewed + s.issuesClosed;
+              heat = Math.ceil((total / maxActivity) * 4);
+            }
+
+            const heatColors = [
+              "bg-bearing-overlay",
+              "bg-bearing-accent/20",
+              "bg-bearing-accent/40",
+              "bg-bearing-accent/60",
+              "bg-bearing-accent/80",
+            ];
+
+            return (
+              <button
+                key={week}
+                onClick={() => { setSelectedWeek(week); setViewMode("view"); setPendingReport(null); }}
+                className={`relative shrink-0 w-8 h-8 rounded text-[9px] font-mono leading-none flex flex-col items-center justify-center gap-0.5 transition-all ${
+                  heatColors[heat]
+                } ${
+                  isSelected
+                    ? "ring-1 ring-bearing-accent text-bearing-text"
+                    : "text-bearing-muted hover:text-bearing-subtle hover:ring-1 hover:ring-bearing-border"
+                }`}
+                title={`Week of ${formatWeekDate(week)}`}
+              >
+                <span>{new Date(week + "T00:00:00").getDate()}</span>
+                {isCurrent && (
+                  <span className="absolute -bottom-0.5 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-bearing-accent" />
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {/* Selected week label */}
+        <div className="mt-1.5 pl-6 text-[10px] font-mono text-bearing-muted/60">
+          {formatWeekDate(selectedWeek)} – {formatWeekDate((() => {
+            const d = new Date(selectedWeek + "T00:00:00");
+            d.setDate(d.getDate() + 6);
+            return d.toISOString().slice(0, 10);
+          })())}
+        </div>
+      </div>
+
+      {/* Selected week content */}
+      <div className="flex-1 overflow-y-auto min-h-0">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs font-mono text-bearing-text">
+            week of {formatWeekDate(selectedWeek)}
+          </span>
+          <div className="flex items-center gap-2">
+            {viewMode === "diff" && pendingReport && (
+              <>
+                <button
+                  onClick={handleAcceptGenerated}
+                  className="text-xs font-mono text-bearing-accent hover:text-bearing-text"
+                >
+                  [accept]
+                </button>
+                <button
+                  onClick={handleDiscardGenerated}
+                  className="text-xs font-mono text-bearing-muted hover:text-bearing-text"
+                >
+                  [discard]
+                </button>
+              </>
+            )}
+            {viewMode === "view" && selectedReport && (
+              <button
+                onClick={handleEdit}
+                className="text-xs font-mono text-bearing-muted hover:text-bearing-text"
+              >
+                [edit]
+              </button>
+            )}
+            {viewMode === "edit" && (
+              <>
+                <button
+                  onClick={handleSave}
+                  className="text-xs font-mono text-bearing-accent hover:text-bearing-text"
+                >
+                  [save]
+                </button>
+                <button
+                  onClick={() => setViewMode("view")}
+                  className="text-xs font-mono text-bearing-muted hover:text-bearing-text"
+                >
+                  [cancel]
+                </button>
+              </>
+            )}
+            {viewMode !== "diff" && (
+              <button
+                onClick={handleGenerate}
+                disabled={generating}
+                className="text-xs font-mono text-bearing-accent hover:text-bearing-text disabled:text-bearing-muted"
+              >
+                {generating ? "generating…" : selectedReport ? "[regenerate]" : "[generate]"}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {selectedReport?.stats && viewMode === "view" && (
+          <div className="flex items-center gap-4 mb-3 text-[10px] font-mono text-bearing-muted">
+            <span>{selectedReport.stats.prsOpened} opened</span>
+            <span>{selectedReport.stats.prsMerged} merged</span>
+            <span>{selectedReport.stats.prsReviewed} reviewed</span>
+            <span>{selectedReport.stats.linesAuthored.toLocaleString()} lines</span>
+            <span>{selectedReport.stats.issuesClosed} tasks</span>
+          </div>
+        )}
+
+        {viewMode === "diff" && pendingReport && selectedReport ? (
+          <ReportDiff oldContent={selectedReport.content} newContent={pendingReport.content} />
+        ) : viewMode === "edit" ? (
+          <textarea
+            value={editContent}
+            onChange={(e) => setEditContent(e.target.value)}
+            className="w-full h-full min-h-[200px] bg-bearing-overlay border border-bearing-border rounded p-3 text-xs font-mono text-bearing-text resize-none outline-none focus:border-bearing-accent/50"
+          />
+        ) : selectedReport ? (
+          <div className="prose-bearing text-xs">
+            <MarkdownBase remarkPlugins={[remarkGfm]}>
+              {selectedReport.content}
+            </MarkdownBase>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center py-8 text-xs font-mono text-bearing-muted">
+            <span>no report for this week</span>
+            <button
+              onClick={handleGenerate}
+              disabled={generating}
+              className="mt-2 text-bearing-accent hover:text-bearing-text disabled:text-bearing-muted"
+            >
+              {generating ? "generating…" : "[generate report]"}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ReportDiff({ oldContent, newContent }: { oldContent: string; newContent: string }) {
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
+  const pairs = alignLines(oldLines, newLines);
+
+  return (
+    <div className="grid grid-cols-2 gap-px bg-bearing-border text-xs font-mono border border-bearing-border rounded overflow-hidden">
+      <div className="bg-bearing-bg px-2 py-1 text-[10px] text-bearing-muted">current</div>
+      <div className="bg-bearing-bg px-2 py-1 text-[10px] text-bearing-muted">generated</div>
+      {pairs.map((pair, i) => (
+        <SideBySideRow key={i} left={pair.left} right={pair.right} />
+      ))}
+    </div>
+  );
+}
+
+function SideBySideRow({ left, right }: { left: DiffLine | null; right: DiffLine | null }) {
+  const leftCls = left?.type === "remove"
+    ? "bg-bearing-red/10 text-bearing-red"
+    : left?.type === "changed"
+      ? "bg-bearing-red/10 text-bearing-red"
+      : "text-bearing-muted";
+  const rightCls = right?.type === "add"
+    ? "bg-bearing-cyan/10 text-bearing-cyan"
+    : right?.type === "changed"
+      ? "bg-bearing-cyan/10 text-bearing-cyan"
+      : "text-bearing-muted";
+
+  return (
+    <>
+      <div className={`px-3 py-0.5 bg-bearing-bg ${leftCls} min-h-[1.25rem]`}>
+        {left?.text ?? ""}
+      </div>
+      <div className={`px-3 py-0.5 bg-bearing-bg ${rightCls} min-h-[1.25rem]`}>
+        {right?.text ?? ""}
+      </div>
+    </>
+  );
+}
+
+interface DiffLine {
+  type: "same" | "add" | "remove" | "changed";
+  text: string;
+}
+
+interface LinePair {
+  left: DiffLine | null;
+  right: DiffLine | null;
+}
+
+function alignLines(oldLines: string[], newLines: string[]): LinePair[] {
+  const pairs: LinePair[] = [];
+  let oi = 0;
+  let ni = 0;
+
+  while (oi < oldLines.length && ni < newLines.length) {
+    if (oldLines[oi] === newLines[ni]) {
+      pairs.push({
+        left: { type: "same", text: oldLines[oi] },
+        right: { type: "same", text: newLines[ni] },
+      });
+      oi++;
+      ni++;
+    } else {
+      const lookAhead = 10;
+      let foundInNew = -1;
+      let foundInOld = -1;
+
+      for (let j = 1; j <= lookAhead; j++) {
+        if (ni + j < newLines.length && oldLines[oi] === newLines[ni + j]) {
+          foundInNew = ni + j;
+          break;
+        }
+        if (oi + j < oldLines.length && oldLines[oi + j] === newLines[ni]) {
+          foundInOld = oi + j;
+          break;
+        }
+      }
+
+      if (foundInNew >= 0) {
+        for (let j = ni; j < foundInNew; j++) {
+          pairs.push({ left: null, right: { type: "add", text: newLines[j] } });
+        }
+        ni = foundInNew;
+      } else if (foundInOld >= 0) {
+        for (let j = oi; j < foundInOld; j++) {
+          pairs.push({ left: { type: "remove", text: oldLines[j] }, right: null });
+        }
+        oi = foundInOld;
+      } else {
+        pairs.push({
+          left: { type: "changed", text: oldLines[oi] },
+          right: { type: "changed", text: newLines[ni] },
+        });
+        oi++;
+        ni++;
+      }
+    }
+  }
+
+  while (oi < oldLines.length) {
+    pairs.push({ left: { type: "remove", text: oldLines[oi++] }, right: null });
+  }
+  while (ni < newLines.length) {
+    pairs.push({ left: null, right: { type: "add", text: newLines[ni++] } });
+  }
+
+  return pairs;
 }
 
 const PALETTE = [
@@ -523,9 +915,9 @@ function SettingsPane({ teams }: { teams: LinearTeam[] }) {
   }
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center gap-3">
-        <span className="text-xs font-mono text-bearing-muted">quick task team</span>
+    <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 items-center">
+      <span className="text-xs font-mono text-bearing-muted">quick task team</span>
+      <div>
         <button
           ref={taskTeamDd.btnRef}
           onClick={taskTeamDd.toggle}
@@ -573,8 +965,8 @@ function SettingsPane({ teams }: { teams: LinearTeam[] }) {
         )}
       </div>
 
-      <div className="flex items-center gap-3">
-        <span className="text-xs font-mono text-bearing-muted">stats repos</span>
+      <span className="text-xs font-mono text-bearing-muted">stats repos</span>
+      <div>
         <button
           ref={repoDd.btnRef}
           onClick={repoDd.toggle}
@@ -621,8 +1013,8 @@ function SettingsPane({ teams }: { teams: LinearTeam[] }) {
         )}
       </div>
 
-      <div className="flex items-center gap-3">
-        <span className="text-xs font-mono text-bearing-muted">stats teams</span>
+      <span className="text-xs font-mono text-bearing-muted">stats teams</span>
+      <div>
         <button
           ref={teamDd.btnRef}
           onClick={teamDd.toggle}

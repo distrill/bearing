@@ -47,6 +47,13 @@ export function initDb(): Database.Database {
       issue_id TEXT NOT NULL,
       PRIMARY KEY (tag, issue_id)
     );
+
+    CREATE TABLE IF NOT EXISTS weekly_reports (
+      week_start TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      generated_at TEXT NOT NULL,
+      stats_json TEXT
+    );
   `);
 
   return db;

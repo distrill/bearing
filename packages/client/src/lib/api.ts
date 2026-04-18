@@ -1,4 +1,4 @@
-import type { PullRequestsResponse, LinearIssuesResponse, LinearStatus, LinearTeam, LinearIssue, PRDetailResponse, ReposResponse, StatsResponse } from "@bearing/shared";
+import type { PullRequestsResponse, LinearIssuesResponse, LinearStatus, LinearTeam, LinearIssue, PRDetailResponse, ReposResponse, StatsResponse, WeeklyReport, ReportsListResponse } from "@bearing/shared";
 import type { GitHubUser } from "@bearing/shared";
 
 async function get<T>(path: string): Promise<T> {
@@ -193,4 +193,26 @@ export function fetchStats(repos: string[], teams: string[]) {
   if (repos.length > 0) params.set("repos", repos.join(","));
   if (teams.length > 0) params.set("teams", teams.join(","));
   return get<StatsResponse>(`/api/stats?${params}`);
+}
+
+// Reports
+
+export function fetchReports() {
+  return get<ReportsListResponse>("/api/reports");
+}
+
+export function fetchReport(weekStart: string) {
+  return get<WeeklyReport>(`/api/reports/${encodeURIComponent(weekStart)}`);
+}
+
+export function saveReport(weekStart: string, content: string, stats?: WeeklyReport["stats"]) {
+  return put<{ ok: boolean }>(`/api/reports/${encodeURIComponent(weekStart)}`, { content, stats });
+}
+
+export function generateReport(weekStart: string, repos: string[], teams: string[], preview = false) {
+  const params = new URLSearchParams();
+  if (repos.length > 0) params.set("repos", repos.join(","));
+  if (teams.length > 0) params.set("teams", teams.join(","));
+  if (preview) params.set("preview", "1");
+  return post<WeeklyReport>(`/api/reports/${encodeURIComponent(weekStart)}/generate?${params}`, {});
 }

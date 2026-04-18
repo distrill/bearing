@@ -5,6 +5,7 @@ import { initDb } from "./db.js";
 import { githubRoutes } from "./routes/github.js";
 import { linearRoutes } from "./routes/linear.js";
 import { tagRoutes } from "./routes/tags.js";
+import { reportRoutes } from "./routes/reports.js";
 
 const config = loadConfig();
 const db = initDb();
@@ -24,6 +25,7 @@ app.get("/api/health", async () => {
 await githubRoutes(app, config);
 await linearRoutes(app, config);
 await tagRoutes(app, db);
+await reportRoutes(app, db, config);
 
 try {
   await app.listen({ port: 3001, host: "127.0.0.1" });

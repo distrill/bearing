@@ -636,9 +636,12 @@ query($query: String!, $first: Int!) {
     nodes {
       ... on PullRequest {
         number
+        title
+        state
         createdAt
         mergedAt
         additions
+        deletions
         repository { name owner { login } }
         reviews(first: 50) {
           nodes {
@@ -652,17 +655,31 @@ query($query: String!, $first: Int!) {
 }
 `;
 
+interface StatsPRNode {
+  number: number;
+  title: string;
+  state: string;
+  createdAt: string;
+  mergedAt: string | null;
+  additions: number;
+  deletions: number;
+  repository: { name: string; owner: { login: string } };
+  reviews: { nodes: Array<{ author: { login: string } | null; submittedAt: string }> };
+}
+
 interface StatsSearchResult {
   search: {
-    nodes: Array<{
-      number: number;
-      createdAt: string;
-      mergedAt: string | null;
-      additions: number;
-      repository: { name: string; owner: { login: string } };
-      reviews: { nodes: Array<{ author: { login: string } | null; submittedAt: string }> };
-    }>;
+    nodes: StatsPRNode[];
   };
+}
+
+export interface PRSummary {
+  number: number;
+  title: string;
+  repo: string;
+  state: string;
+  additions: number;
+  deletions: number;
 }
 
 export interface DailyStats {
@@ -671,6 +688,8 @@ export interface DailyStats {
   prsMerged: number[];
   prsReviewed: number[];
   linesAuthored: number[];
+  authoredPRs?: PRSummary[];
+  reviewedPRs?: PRSummary[];
 }
 
 function dateBucket(iso: string): string {
@@ -691,22 +710,27 @@ export function makeDays(count: number): string[] {
 export async function fetchGitHubStats(
   token: string,
   repos: string[],
+  startDate?: string,
+  endDate?: string,
 ): Promise<DailyStats> {
-  const days = makeDays(14);
+  const useRange = startDate && endDate;
+  const days = useRange ? makeDaysRange(startDate, endDate) : makeDays(14);
+  const numDays = days.length;
   const cutoff = days[0];
   const repoFilter = repos.map((r) => `repo:${r}`).join(" ");
+  const dateRange = useRange ? `${cutoff}..${endDate}` : `>=${cutoff}`;
 
   const [authored, merged, reviewed] = await Promise.all([
     graphql<StatsSearchResult>(token, STATS_PR_QUERY, {
-      query: `type:pr author:@me ${repoFilter} created:>=${cutoff}`,
+      query: `type:pr author:@me ${repoFilter} created:${dateRange}`,
       first: 100,
     }),
     graphql<StatsSearchResult>(token, STATS_PR_QUERY, {
-      query: `type:pr author:@me ${repoFilter} merged:>=${cutoff}`,
+      query: `type:pr author:@me ${repoFilter} merged:${dateRange}`,
       first: 100,
     }),
     graphql<StatsSearchResult>(token, STATS_PR_QUERY, {
-      query: `type:pr reviewed-by:@me ${repoFilter} -author:@me updated:>=${cutoff}`,
+      query: `type:pr reviewed-by:@me ${repoFilter} -author:@me updated:${dateRange}`,
       first: 100,
     }),
   ]);
@@ -714,16 +738,20 @@ export async function fetchGitHubStats(
   const viewerData = await graphql<ViewerResult>(token, VIEWER_QUERY);
   const viewerLogin = viewerData.viewer.login.toLowerCase();
 
-  const prsOpened = new Array(14).fill(0);
-  const prsMerged = new Array(14).fill(0);
-  const prsReviewed = new Array(14).fill(0);
-  const linesAuthored = new Array(14).fill(0);
+  const prsOpened = new Array(numDays).fill(0);
+  const prsMerged = new Array(numDays).fill(0);
+  const prsReviewed = new Array(numDays).fill(0);
+  const linesAuthored = new Array(numDays).fill(0);
 
   const dayIndex = new Map(days.map((d, i) => [d, i]));
+
+  const authoredSet = new Map<string, StatsPRNode>();
 
   for (const pr of authored.search.nodes) {
     const idx = dayIndex.get(dateBucket(pr.createdAt));
     if (idx !== undefined) prsOpened[idx]++;
+    const k = `${pr.repository.owner.login}/${pr.repository.name}#${pr.number}`;
+    if (!authoredSet.has(k)) authoredSet.set(k, pr);
   }
 
   for (const pr of merged.search.nodes) {
@@ -733,8 +761,11 @@ export async function fetchGitHubStats(
       prsMerged[idx]++;
       linesAuthored[idx] += pr.additions;
     }
+    const k = `${pr.repository.owner.login}/${pr.repository.name}#${pr.number}`;
+    if (!authoredSet.has(k)) authoredSet.set(k, pr);
   }
 
+  const reviewedSet = new Map<string, StatsPRNode>();
   const reviewedPRDays = new Set<string>();
   for (const pr of reviewed.search.nodes) {
     for (const review of pr.reviews.nodes) {
@@ -746,9 +777,35 @@ export async function fetchGitHubStats(
       const idx = dayIndex.get(day);
       if (idx !== undefined) prsReviewed[idx]++;
     }
+    const k = `${pr.repository.owner.login}/${pr.repository.name}#${pr.number}`;
+    if (!reviewedSet.has(k)) reviewedSet.set(k, pr);
   }
 
-  return { days, prsOpened, prsMerged, prsReviewed, linesAuthored };
+  const toSummary = (pr: StatsPRNode): PRSummary => ({
+    number: pr.number,
+    title: pr.title,
+    repo: `${pr.repository.owner.login}/${pr.repository.name}`,
+    state: pr.state.toLowerCase(),
+    additions: pr.additions,
+    deletions: pr.deletions,
+  });
+
+  return {
+    days, prsOpened, prsMerged, prsReviewed, linesAuthored,
+    authoredPRs: [...authoredSet.values()].map(toSummary),
+    reviewedPRs: [...reviewedSet.values()].map(toSummary),
+  };
+}
+
+function makeDaysRange(start: string, end: string): string[] {
+  const days: string[] = [];
+  const d = new Date(start + "T00:00:00");
+  const endDate = new Date(end + "T00:00:00");
+  while (d <= endDate) {
+    days.push(d.toISOString().slice(0, 10));
+    d.setDate(d.getDate() + 1);
+  }
+  return days;
 }
 
 export async function closePR(
