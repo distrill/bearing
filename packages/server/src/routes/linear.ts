@@ -23,6 +23,7 @@ export async function linearRoutes(
 
     if (refresh !== undefined) {
       invalidatePrefix("issues");
+      invalidatePrefix("linear-viewer-ids");
     }
 
     const [issues, viewerIds] = await Promise.all([

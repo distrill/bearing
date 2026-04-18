@@ -15,12 +15,13 @@ export async function reportRoutes(
       .prepare("SELECT week_start, content, generated_at, stats_json FROM weekly_reports ORDER BY week_start DESC")
       .all() as Array<{ week_start: string; content: string; generated_at: string; stats_json: string | null }>;
 
-    const reports: WeeklyReport[] = rows.map((r) => ({
-      weekStart: r.week_start,
-      content: r.content,
-      generatedAt: r.generated_at,
-      stats: r.stats_json ? JSON.parse(r.stats_json) : null,
-    }));
+    const reports: WeeklyReport[] = rows.map((r) => {
+      let stats: WeeklyReport["stats"] = null;
+      if (r.stats_json) {
+        try { stats = JSON.parse(r.stats_json); } catch { /* ignore corrupt json */ }
+      }
+      return { weekStart: r.week_start, content: r.content, generatedAt: r.generated_at, stats };
+    });
 
     return { reports };
   });
@@ -40,7 +41,7 @@ export async function reportRoutes(
       weekStart: row.week_start,
       content: row.content,
       generatedAt: row.generated_at,
-      stats: row.stats_json ? JSON.parse(row.stats_json) : null,
+      stats: (() => { try { return row.stats_json ? JSON.parse(row.stats_json) : null; } catch { return null; } })(),
     } satisfies WeeklyReport;
   });
 
@@ -218,13 +219,21 @@ Keep it concise and factual. Use the data provided — don't invent details. If 
     }
 
     const result = await anthropicRes.json() as {
-      content: Array<{ type: string; text?: string }>;
+      content?: Array<{ type: string; text?: string }>;
     };
 
+    if (!result.content || !Array.isArray(result.content)) {
+      return reply.code(502).send({ error: "Unexpected response from Anthropic API" });
+    }
+
     const content = result.content
-      .filter((c) => c.type === "text")
+      .filter((c) => c.type === "text" && c.text)
       .map((c) => c.text)
       .join("\n");
+
+    if (!content.trim()) {
+      return reply.code(502).send({ error: "Anthropic API returned empty content" });
+    }
 
     const preview = (request.query as { preview?: string }).preview !== undefined;
     const now = new Date().toISOString();

@@ -94,13 +94,16 @@ export async function tagRoutes(
   });
 
   // Tag a PR
-  app.post("/api/tags/pr", async (request) => {
+  app.post("/api/tags/pr", async (request, reply) => {
     const { tag, owner, repo, number } = request.body as {
       tag: string;
       owner: string;
       repo: string;
       number: number;
     };
+    if (!tag || !owner || !repo || number == null) {
+      return reply.status(400).send({ error: "tag, owner, repo, and number required" });
+    }
     db.prepare(
       "INSERT OR IGNORE INTO pr_tags (tag, owner, repo, number) VALUES (?, ?, ?, ?)",
     ).run(tag, owner, repo, number);

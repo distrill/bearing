@@ -65,9 +65,14 @@ export async function githubRoutes(
       number: string;
     };
 
+    const prNumber = parseInt(number, 10);
+    if (Number.isNaN(prNumber)) {
+      return reply.code(400).send({ error: "Invalid PR number" });
+    }
+
     const detail = await cached(
       `pr-detail:${owner}/${repo}#${number}`,
-      () => getPRDetail(config.github.token, owner, repo, parseInt(number, 10)),
+      () => getPRDetail(config.github.token, owner, repo, prNumber),
     );
 
     return detail;
@@ -83,6 +88,10 @@ export async function githubRoutes(
       repo: string;
       number: string;
     };
+    const prNumber = parseInt(number, 10);
+    if (Number.isNaN(prNumber)) {
+      return reply.code(400).send({ error: "Invalid PR number" });
+    }
     const { body, event, comments } = request.body as {
       body: string;
       event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
@@ -97,7 +106,7 @@ export async function githubRoutes(
       config.github.token,
       owner,
       repo,
-      parseInt(number, 10),
+      prNumber,
       body,
       event,
       comments,
@@ -118,13 +127,17 @@ export async function githubRoutes(
       repo: string;
       number: string;
     };
+    const prNumber = parseInt(number, 10);
+    if (Number.isNaN(prNumber)) {
+      return reply.code(400).send({ error: "Invalid PR number" });
+    }
     const { method, commitMessage } = request.body as { method: "merge" | "squash" | "rebase"; commitMessage?: string };
 
     if (!["merge", "squash", "rebase"].includes(method)) {
       return reply.code(400).send({ error: "Invalid merge method" });
     }
 
-    await mergePR(config.github.token, owner, repo, parseInt(number, 10), method, commitMessage);
+    await mergePR(config.github.token, owner, repo, prNumber, method, commitMessage);
     invalidatePrefix(`pr-detail:${owner}/${repo}#${number}`);
     invalidatePrefix("prs:");
 
@@ -141,8 +154,12 @@ export async function githubRoutes(
       repo: string;
       number: string;
     };
+    const prNumber = parseInt(number, 10);
+    if (Number.isNaN(prNumber)) {
+      return reply.code(400).send({ error: "Invalid PR number" });
+    }
 
-    await closePR(config.github.token, owner, repo, parseInt(number, 10));
+    await closePR(config.github.token, owner, repo, prNumber);
     invalidatePrefix(`pr-detail:${owner}/${repo}#${number}`);
     invalidatePrefix("prs:");
 
@@ -203,7 +220,10 @@ export async function githubRoutes(
       return reply.code(503).send({ error: "GitHub token not configured" });
     }
 
-    const { repos, teams } = request.query as { repos?: string; teams?: string };
+    const { repos, teams, refresh } = request.query as { repos?: string; teams?: string; refresh?: string };
+    if (refresh !== undefined) {
+      invalidatePrefix("stats:");
+    }
     const repoList = repos ? repos.split(",").filter(Boolean) : [];
     const teamList = teams ? teams.split(",").filter(Boolean) : [];
 

@@ -68,39 +68,38 @@ export function Shell({ children, onRefresh, tags = [], onTagsChange, onIssueCre
           bearing
         </a>
         <span className="flex-1" />
-        {updateAvailable && !isReview && (
-          <button
-            onClick={() => window.dispatchEvent(new Event("bearing:applyUpdate"))}
-            className="text-xs font-mono text-bearing-accent hover:text-bearing-text"
-          >
-            [update available]
-          </button>
-        )}
+        <button
+          onClick={() => window.dispatchEvent(new Event("bearing:applyUpdate"))}
+          className={`text-xs font-mono text-bearing-accent hover:text-bearing-text ${
+            updateAvailable && !isReview ? "visible" : "invisible"
+          }`}
+        >
+          [update available]
+        </button>
         <span className="flex-1" />
         <div className="flex items-center gap-3">
-          {onRefresh && !isReview && (
-            <>
-              <button
-                onClick={() => window.dispatchEvent(new Event("bearing:resetAttention"))}
-                className="text-xs font-mono text-bearing-muted hover:text-bearing-text"
-              >
-                [reset attention]
-              </button>
-              <button
-                onClick={onRefresh}
-                className="text-xs font-mono text-bearing-muted hover:text-bearing-text"
-              >
-                [refresh]
-              </button>
-            </>
-          )}
-          {isReview && (
+          {isReview ? (
             <a
               href="/"
               className="text-xs text-bearing-muted hover:text-bearing-text font-mono"
             >
-              [← dashboard]
+              [dashboard]
             </a>
+          ) : (
+            <>
+              <button
+                onClick={() => window.dispatchEvent(new Event("bearing:resetAttention"))}
+                className={`text-xs font-mono text-bearing-muted hover:text-bearing-text ${onRefresh ? "visible" : "invisible"}`}
+              >
+                [reset attention]
+              </button>
+              <button
+                onClick={onRefresh ?? undefined}
+                className={`text-xs font-mono text-bearing-muted hover:text-bearing-text ${onRefresh ? "visible" : "invisible"}`}
+              >
+                [refresh]
+              </button>
+            </>
           )}
         </div>
       </header>
@@ -119,6 +118,7 @@ export function Shell({ children, onRefresh, tags = [], onTagsChange, onIssueCre
             onResetAttention={() => {
               window.dispatchEvent(new Event("bearing:resetAttention"));
             }}
+            onOpenSettings={() => { setPaletteOpen(false); setShelfTab("settings"); }}
           />
         )}
         {!isReview && <div className="absolute bottom-0 left-0 right-0 h-1/3 pointer-events-none">
@@ -309,6 +309,7 @@ function ReportsPane() {
   const [viewMode, setViewMode] = useState<ReportView>("view");
   const [editContent, setEditContent] = useState("");
   const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [pendingReport, setPendingReport] = useState<WeeklyReport | null>(null);
   const [reports, setReports] = useState<Map<string, WeeklyReport>>(new Map());
   const [loaded, setLoaded] = useState(false);
@@ -340,6 +341,7 @@ function ReportsPane() {
   const handleGenerate = async () => {
     const hasExisting = !!selectedReport;
     setGenerating(true);
+    setError(null);
     try {
       const report = await generateReport(selectedWeek, repos, teams, hasExisting);
       if (hasExisting) {
@@ -348,8 +350,8 @@ function ReportsPane() {
       } else {
         setReports((prev) => new Map(prev).set(selectedWeek, report));
       }
-    } catch {
-      // TODO: surface error
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to generate report");
     } finally {
       setGenerating(false);
     }
@@ -424,7 +426,7 @@ function ReportsPane() {
               <button
                 key={week}
                 onClick={() => { setSelectedWeek(week); setViewMode("view"); setPendingReport(null); }}
-                className={`relative shrink-0 w-8 h-8 rounded text-[9px] font-mono leading-none flex flex-col items-center justify-center gap-0.5 transition-all ${
+                className={`relative shrink-0 w-10 h-8 rounded text-[9px] font-mono leading-none flex flex-col items-center justify-center gap-0.5 transition-all ${
                   heatColors[heat]
                 } ${
                   isSelected
@@ -433,7 +435,7 @@ function ReportsPane() {
                 }`}
                 title={`Week of ${formatWeekDate(week)}`}
               >
-                <span>{new Date(week + "T00:00:00").getDate()}</span>
+                <span>{(() => { const d = new Date(week + "T00:00:00"); return `${d.getMonth() + 1}/${d.getDate()}`; })()}</span>
                 {isCurrent && (
                   <span className="absolute -bottom-0.5 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-bearing-accent" />
                 )}
@@ -510,6 +512,10 @@ function ReportsPane() {
           </div>
         </div>
 
+        {error && viewMode !== "diff" && (
+          <div className="mb-2 text-xs font-mono text-bearing-red">{error}</div>
+        )}
+
         {selectedReport?.stats && viewMode === "view" && (
           <div className="flex items-center gap-4 mb-3 text-[10px] font-mono text-bearing-muted">
             <span>{selectedReport.stats.prsOpened} opened</span>
@@ -544,6 +550,7 @@ function ReportsPane() {
             >
               {generating ? "generating…" : "[generate report]"}
             </button>
+            {error && <span className="mt-2 text-bearing-red">{error}</span>}
           </div>
         )}
       </div>
@@ -867,6 +874,8 @@ function SettingsPane({ teams }: { teams: LinearTeam[] }) {
     JSON.parse(localStorage.getItem("bearing:statsTeams") ?? "[]"),
   );
 
+  const [reposError, setReposError] = useState(false);
+
   const taskTeamDd = usePortalDropdown();
   const repoDd = usePortalDropdown();
   const teamDd = usePortalDropdown();
@@ -876,8 +885,8 @@ function SettingsPane({ teams }: { teams: LinearTeam[] }) {
 
   useEffect(() => {
     fetchRepos()
-      .then((r) => setAvailableRepos(r.repos))
-      .catch(() => {});
+      .then((r) => { setAvailableRepos(r.repos); setReposError(false); })
+      .catch(() => setReposError(true));
   }, []);
 
   const handleTaskTeamChange = (teamId: string) => {
@@ -982,7 +991,9 @@ function SettingsPane({ teams }: { teams: LinearTeam[] }) {
             className="fixed z-50 bg-bearing-surface border border-bearing-border rounded shadow-lg py-1 min-w-[200px] max-h-[50vh] overflow-y-auto"
             style={{ bottom: `calc(100vh - ${repoDd.pos.top}px)`, left: repoDd.pos.left }}
           >
-            {availableRepos.length === 0 ? (
+            {reposError ? (
+              <div className="px-3 py-1.5 text-xs font-mono text-bearing-red">failed to load repos</div>
+            ) : availableRepos.length === 0 ? (
               <div className="px-3 py-1.5 text-xs font-mono text-bearing-muted">loading…</div>
             ) : (
               repoOrgs.map((org) => (
@@ -1083,6 +1094,7 @@ function CommandPalette({
   onClearSearch,
   onRefresh,
   onResetAttention,
+  onOpenSettings,
 }: {
   teams: LinearTeam[];
   onClose: () => void;
@@ -1091,6 +1103,7 @@ function CommandPalette({
   onClearSearch?: () => void;
   onRefresh?: () => void;
   onResetAttention?: () => void;
+  onOpenSettings?: () => void;
 }) {
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<PaletteMode>("commands");
@@ -1147,6 +1160,8 @@ function CommandPalette({
         if (defaultTeam) {
           setMode("create-task");
           setInput("");
+        } else {
+          onOpenSettings?.();
         }
       },
     },

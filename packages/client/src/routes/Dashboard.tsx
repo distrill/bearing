@@ -108,19 +108,22 @@ function useExclusionFilter(key: string, options: string[], defaultExcluded?: Se
   const [excluded, setExcluded] = usePersistedSet(key);
   const [initialized, setInitialized] = useState(() => localStorage.getItem(key) !== null);
 
+  const hasOptions = options.length > 0;
   useEffect(() => {
-    if (!initialized && options.length > 0 && defaultExcluded && defaultExcluded.size > 0) {
+    if (!initialized && hasOptions && defaultExcluded && defaultExcluded.size > 0) {
       setExcluded(defaultExcluded);
       setInitialized(true);
     }
-  }, [options.length > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [initialized, hasOptions, defaultExcluded, setExcluded]);
 
   const selected = new Set(options.filter((o) => !excluded.has(o)));
 
+  const optionsKey = options.join(",");
   const setSelected = useCallback((next: Set<string>) => {
-    const nextExcluded = new Set(options.filter((o) => !next.has(o)));
+    const opts = optionsKey.split(",");
+    const nextExcluded = new Set(opts.filter((o) => !next.has(o)));
     setExcluded(nextExcluded);
-  }, [options.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [optionsKey, setExcluded]);
 
   return [selected, setSelected];
 }
