@@ -44,6 +44,7 @@ const PR_STATUS_COLORS: Record<string, string> = {
 };
 
 const TERMINAL_PR_STATUSES = new Set(["merged", "closed"]);
+const TERMINAL_TYPES = new Set(["completed", "cancelled"]);
 
 function dedupeAndTag(
   review: PullRequest[],
@@ -101,6 +102,27 @@ function usePersistedSet(key: string): [Set<string>, (next: Set<string>) => void
     saveSet(key, next);
   }, [key]);
   return [value, set];
+}
+
+function useExclusionFilter(key: string, options: string[], defaultExcluded?: Set<string>): [Set<string>, (next: Set<string>) => void] {
+  const [excluded, setExcluded] = usePersistedSet(key);
+  const [initialized, setInitialized] = useState(() => localStorage.getItem(key) !== null);
+
+  useEffect(() => {
+    if (!initialized && options.length > 0 && defaultExcluded && defaultExcluded.size > 0) {
+      setExcluded(defaultExcluded);
+      setInitialized(true);
+    }
+  }, [options.length > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const selected = new Set(options.filter((o) => !excluded.has(o)));
+
+  const setSelected = useCallback((next: Set<string>) => {
+    const nextExcluded = new Set(options.filter((o) => !next.has(o)));
+    setExcluded(nextExcluded);
+  }, [options.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return [selected, setSelected];
 }
 
 function loadMap(key: string): Map<string, number> {
@@ -190,7 +212,6 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
     prTags: [],
     issueTags: [],
   });
-  const [filterTags, setFilterTags] = usePersistedSet("bearing:filterTags");
   const [untouchedOnly, setUntouchedOnly] = usePersistedBool("bearing:untouchedOnly", false);
   const { touch, needsAttention } = useLastTouched();
 
@@ -350,10 +371,6 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
   }, []);
 
   const [showSuggested, setShowSuggested] = usePersistedBool("bearing:showSuggested", true);
-  const [filterWorkspaces, setFilterWorkspaces] = usePersistedSet("bearing:filterWorkspaces");
-  const [filterRepos, setFilterRepos] = usePersistedSet("bearing:filterRepos");
-  const [filterStatuses, setFilterStatuses] = usePersistedSet("bearing:filterStatuses");
-  const [filterPrStatuses, setFilterPrStatuses] = usePersistedSet("bearing:filterPrStatuses2");
 
   const allPrs = dedupeAndTag(
     reviewPrs,
@@ -385,7 +402,6 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
   const workspaces = [...new Set(issues.map((i) => i.workspace))].sort();
   const repos = [...new Set(allPrs.map((pr) => `${pr.owner}/${pr.repo}`))].sort();
 
-  const TERMINAL_TYPES = new Set(["completed", "cancelled"]);
   const [allWorkflowStates, setAllWorkflowStates] = useState<LinearStatus[]>([]);
   const teamKeys = [...new Set(issues.map((i) => i.teamKey))];
   useEffect(() => {
@@ -422,37 +438,19 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
   // Available tag filter values
   const allTagValues = tags.map((t) => t.name);
   if (hasUntagged) allTagValues.push("__untagged__");
-  const allTagKey = allTagValues.join(",");
 
-  // Initialize filters with all values when data first arrives
-  useEffect(() => {
-    if (workspaces.length > 0 && filterWorkspaces.size === 0)
-      setFilterWorkspaces(new Set(workspaces));
-  }, [workspaces.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
+  const defaultExcludedStatuses = new Set(
+    statuses.filter((s) => TERMINAL_TYPES.has(statusTypeMap.get(s) ?? "")),
+  );
+  const defaultExcludedPrStatuses = new Set(
+    prStatuses.filter((s) => TERMINAL_PR_STATUSES.has(s)),
+  );
 
-  useEffect(() => {
-    if (repos.length > 0 && filterRepos.size === 0)
-      setFilterRepos(new Set(repos));
-  }, [repos.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (allTagValues.length > 0 && filterTags.size === 0)
-      setFilterTags(new Set(allTagValues));
-  }, [allTagKey]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (statuses.length > 0 && filterStatuses.size === 0)
-      setFilterStatuses(new Set(
-        statuses.filter((s) => !TERMINAL_TYPES.has(statusTypeMap.get(s) ?? "")),
-      ));
-  }, [statuses.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (prStatuses.length > 0 && filterPrStatuses.size === 0)
-      setFilterPrStatuses(new Set(
-        prStatuses.filter((s) => !TERMINAL_PR_STATUSES.has(s)),
-      ));
-  }, [prStatuses.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [filterWorkspaces, setFilterWorkspaces] = useExclusionFilter("bearing:excludeWorkspaces", workspaces);
+  const [filterRepos, setFilterRepos] = useExclusionFilter("bearing:excludeRepos", repos);
+  const [filterTags, setFilterTags] = useExclusionFilter("bearing:excludeTags", allTagValues);
+  const [filterStatuses, setFilterStatuses] = useExclusionFilter("bearing:excludeStatuses", statuses, defaultExcludedStatuses);
+  const [filterPrStatuses, setFilterPrStatuses] = useExclusionFilter("bearing:excludePrStatuses", prStatuses, defaultExcludedPrStatuses);
 
   // Apply filters
   const untaggedActive = filterTags.has("__untagged__");
