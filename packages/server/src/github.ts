@@ -349,6 +349,7 @@ async function restPost<T>(token: string, path: string, body: unknown): Promise<
 export interface InlineCommentPayload {
   path: string;
   line: number;
+  start_line?: number;
   side: "LEFT" | "RIGHT";
   body: string;
 }
@@ -383,6 +384,17 @@ interface RawRestPR {
   additions: number;
   deletions: number;
   changed_files: number;
+  mergeable: boolean | null;
+  mergeable_state: string;
+  head: { sha: string };
+}
+
+interface RawRestCheckRun {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  html_url: string;
 }
 
 interface RawRestFile {
@@ -408,6 +420,7 @@ interface RawRestComment {
   body: string;
   path: string;
   line: number | null;
+  start_line: number | null;
   original_line: number | null;
   side: string | null;
   user: { login: string; avatar_url: string };
@@ -444,7 +457,7 @@ export async function getPRDetail(
   const [pr, files, reviews, comments, issueComments, commits] = await Promise.all([
     restGet<RawRestPR>(token, base),
     restGet<RawRestFile[]>(token, `${base}/files?per_page=100`),
-    restGet<RawRestReview[]>(token, `${base}/reviews`),
+    restGet<RawRestReview[]>(token, `${base}/reviews?per_page=100`),
     restGet<RawRestComment[]>(token, `${base}/comments?per_page=100`),
     restGet<RawRestIssueComment[]>(
       token,
@@ -452,6 +465,17 @@ export async function getPRDetail(
     ),
     restGet<RawRestCommit[]>(token, `${base}/commits?per_page=100`),
   ]);
+
+  const repoData = await restGet<{
+    allow_merge_commit: boolean;
+    allow_squash_merge: boolean;
+    allow_rebase_merge: boolean;
+  }>(token, `/repos/${owner}/${repo}`);
+
+  const checkRunsData = await restGet<{ check_runs: RawRestCheckRun[] }>(
+    token,
+    `/repos/${owner}/${repo}/commits/${pr.head.sha}/check-runs?per_page=100`,
+  );
 
   return {
     title: pr.title,
@@ -489,6 +513,7 @@ export async function getPRDetail(
       body: c.body,
       path: c.path,
       line: c.line ?? c.original_line ?? null,
+      startLine: c.start_line ?? null,
       side: (c.side as "LEFT" | "RIGHT") ?? "RIGHT",
       author: { login: c.user.login, avatarUrl: c.user.avatar_url },
       createdAt: c.created_at,
@@ -510,5 +535,229 @@ export async function getPRDetail(
         : { login: "unknown", avatarUrl: "" },
       committedAt: c.commit.author.date,
     })),
+    checkRuns: checkRunsData.check_runs.map((cr) => ({
+      id: cr.id,
+      name: cr.name,
+      status: cr.status as "queued" | "in_progress" | "completed",
+      conclusion: cr.conclusion as any,
+      htmlUrl: cr.html_url,
+    })),
+    mergeable: pr.mergeable,
+    mergeableState: pr.mergeable_state,
+    allowedMergeMethods: [
+      ...(repoData.allow_merge_commit ? ["merge" as const] : []),
+      ...(repoData.allow_squash_merge ? ["squash" as const] : []),
+      ...(repoData.allow_rebase_merge ? ["rebase" as const] : []),
+    ],
+    truncated: [
+      ...(files.length >= 100 ? ["files"] : []),
+      ...(reviews.length >= 100 ? ["reviews"] : []),
+      ...(comments.length >= 100 ? ["comments"] : []),
+      ...(issueComments.length >= 100 ? ["issueComments"] : []),
+      ...(commits.length >= 100 ? ["commits"] : []),
+      ...(checkRunsData.check_runs.length >= 100 ? ["checkRuns"] : []),
+    ],
   };
+}
+
+async function restPut<T>(token: string, path: string, body: unknown): Promise<T> {
+  const res = await fetch(`https://api.github.com${path}`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.v3+json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub REST API error: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export async function mergePR(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+  method: "merge" | "squash" | "rebase",
+  commitMessage?: string,
+): Promise<void> {
+  await restPut(token, `/repos/${owner}/${repo}/pulls/${number}/merge`, {
+    merge_method: method,
+    ...(commitMessage ? { commit_message: commitMessage } : {}),
+  });
+}
+
+async function restPatch<T>(token: string, path: string, body: unknown): Promise<T> {
+  const res = await fetch(`https://api.github.com${path}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.v3+json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub REST API error: ${res.status} ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+// --- Stats ---
+
+interface RepoInfo {
+  owner: string;
+  name: string;
+  fullName: string;
+}
+
+export async function fetchUserRepos(token: string): Promise<RepoInfo[]> {
+  const repos = await restGet<Array<{
+    name: string;
+    full_name: string;
+    owner: { login: string };
+  }>>(token, "/user/repos?sort=pushed&per_page=50&affiliation=owner,collaborator,organization_member");
+
+  return repos.map((r) => ({
+    owner: r.owner.login,
+    name: r.name,
+    fullName: r.full_name,
+  }));
+}
+
+const STATS_PR_QUERY = `
+query($query: String!, $first: Int!) {
+  search(query: $query, type: ISSUE, first: $first) {
+    nodes {
+      ... on PullRequest {
+        number
+        createdAt
+        mergedAt
+        additions
+        repository { name owner { login } }
+        reviews(first: 50) {
+          nodes {
+            author { login }
+            submittedAt
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+interface StatsSearchResult {
+  search: {
+    nodes: Array<{
+      number: number;
+      createdAt: string;
+      mergedAt: string | null;
+      additions: number;
+      repository: { name: string; owner: { login: string } };
+      reviews: { nodes: Array<{ author: { login: string } | null; submittedAt: string }> };
+    }>;
+  };
+}
+
+export interface DailyStats {
+  days: string[];
+  prsOpened: number[];
+  prsMerged: number[];
+  prsReviewed: number[];
+  linesAuthored: number[];
+}
+
+function dateBucket(iso: string): string {
+  return iso.slice(0, 10);
+}
+
+export function makeDays(count: number): string[] {
+  const days: string[] = [];
+  const now = new Date();
+  for (let i = count - 1; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    days.push(d.toISOString().slice(0, 10));
+  }
+  return days;
+}
+
+export async function fetchGitHubStats(
+  token: string,
+  repos: string[],
+): Promise<DailyStats> {
+  const days = makeDays(14);
+  const cutoff = days[0];
+  const repoFilter = repos.map((r) => `repo:${r}`).join(" ");
+
+  const [authored, merged, reviewed] = await Promise.all([
+    graphql<StatsSearchResult>(token, STATS_PR_QUERY, {
+      query: `type:pr author:@me ${repoFilter} created:>=${cutoff}`,
+      first: 100,
+    }),
+    graphql<StatsSearchResult>(token, STATS_PR_QUERY, {
+      query: `type:pr author:@me ${repoFilter} merged:>=${cutoff}`,
+      first: 100,
+    }),
+    graphql<StatsSearchResult>(token, STATS_PR_QUERY, {
+      query: `type:pr reviewed-by:@me ${repoFilter} -author:@me updated:>=${cutoff}`,
+      first: 100,
+    }),
+  ]);
+
+  const viewerData = await graphql<ViewerResult>(token, VIEWER_QUERY);
+  const viewerLogin = viewerData.viewer.login.toLowerCase();
+
+  const prsOpened = new Array(14).fill(0);
+  const prsMerged = new Array(14).fill(0);
+  const prsReviewed = new Array(14).fill(0);
+  const linesAuthored = new Array(14).fill(0);
+
+  const dayIndex = new Map(days.map((d, i) => [d, i]));
+
+  for (const pr of authored.search.nodes) {
+    const idx = dayIndex.get(dateBucket(pr.createdAt));
+    if (idx !== undefined) prsOpened[idx]++;
+  }
+
+  for (const pr of merged.search.nodes) {
+    if (!pr.mergedAt) continue;
+    const idx = dayIndex.get(dateBucket(pr.mergedAt));
+    if (idx !== undefined) {
+      prsMerged[idx]++;
+      linesAuthored[idx] += pr.additions;
+    }
+  }
+
+  const reviewedPRDays = new Set<string>();
+  for (const pr of reviewed.search.nodes) {
+    for (const review of pr.reviews.nodes) {
+      if (!review.author || review.author.login.toLowerCase() !== viewerLogin) continue;
+      const day = dateBucket(review.submittedAt);
+      const key = `${pr.repository.owner.login}/${pr.repository.name}#${pr.number}:${day}`;
+      if (reviewedPRDays.has(key)) continue;
+      reviewedPRDays.add(key);
+      const idx = dayIndex.get(day);
+      if (idx !== undefined) prsReviewed[idx]++;
+    }
+  }
+
+  return { days, prsOpened, prsMerged, prsReviewed, linesAuthored };
+}
+
+export async function closePR(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<void> {
+  await restPatch(token, `/repos/${owner}/${repo}/pulls/${number}`, {
+    state: "closed",
+  });
 }

@@ -1,4 +1,4 @@
-import type { PullRequestsResponse, LinearIssuesResponse, LinearStatus, LinearTeam, LinearIssue, PRDetailResponse } from "@bearing/shared";
+import type { PullRequestsResponse, LinearIssuesResponse, LinearStatus, LinearTeam, LinearIssue, PRDetailResponse, ReposResponse, StatsResponse } from "@bearing/shared";
 import type { GitHubUser } from "@bearing/shared";
 
 async function get<T>(path: string): Promise<T> {
@@ -49,11 +49,35 @@ export function submitReview(
   number: number,
   body: string,
   event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
-  comments?: Array<{ path: string; line: number; side: "LEFT" | "RIGHT"; body: string }>,
+  comments?: Array<{ path: string; line: number; start_line?: number; side: "LEFT" | "RIGHT"; body: string }>,
 ) {
   return post<{ ok: boolean }>(
     `/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/review`,
     { body, event, comments },
+  );
+}
+
+export function mergePR(
+  owner: string,
+  repo: string,
+  number: number,
+  method: "merge" | "squash" | "rebase",
+  commitMessage?: string,
+) {
+  return post<{ ok: boolean }>(
+    `/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/merge`,
+    { method, commitMessage },
+  );
+}
+
+export function closePR(
+  owner: string,
+  repo: string,
+  number: number,
+) {
+  return post<{ ok: boolean }>(
+    `/api/prs/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}/close`,
+    {},
   );
 }
 
@@ -156,4 +180,17 @@ export function tagIssue(tag: string, issue_id: string) {
 
 export function untagIssue(tag: string, issue_id: string) {
   return del<{ ok: boolean }>("/api/tags/issue", { tag, issue_id });
+}
+
+// Stats
+
+export function fetchRepos() {
+  return get<ReposResponse>("/api/repos");
+}
+
+export function fetchStats(repos: string[], teams: string[]) {
+  const params = new URLSearchParams();
+  if (repos.length > 0) params.set("repos", repos.join(","));
+  if (teams.length > 0) params.set("teams", teams.join(","));
+  return get<StatsResponse>(`/api/stats?${params}`);
 }

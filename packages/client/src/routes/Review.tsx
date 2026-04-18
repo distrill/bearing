@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, Fragment } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo, Fragment, memo } from "react";
 import { useParams } from "wouter";
 import type {
   PRDetailResponse,
@@ -6,8 +6,9 @@ import type {
   PullRequestReview,
   ReviewComment,
   IssueComment,
+  CheckRun,
 } from "@bearing/shared";
-import { fetchPRDetail, submitReview, fetchViewer } from "../lib/api";
+import { fetchPRDetail, submitReview, fetchViewer, mergePR, closePR } from "../lib/api";
 import { parsePatch, type DiffHunk, type DiffLine } from "../lib/diff";
 import {
   getHighlighter,
@@ -124,6 +125,25 @@ function saveReviewed(
   localStorage.setItem(reviewedKey(owner, repo, number), JSON.stringify(state));
 }
 
+// --- Hidden participants persistence ---
+
+function hiddenKey(owner: string, repo: string, number: string) {
+  return `bearing:hidden:${owner}/${repo}#${number}`;
+}
+
+function loadHidden(owner: string, repo: string, number: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(hiddenKey(owner, repo, number));
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveHidden(owner: string, repo: string, number: string, hidden: Set<string>) {
+  localStorage.setItem(hiddenKey(owner, repo, number), JSON.stringify([...hidden]));
+}
+
 // --- Comment threading ---
 
 interface CommentThread {
@@ -170,17 +190,69 @@ function useHighlighter(): Highlighter | null {
   return hl;
 }
 
+// --- Highlight cache + lazy highlighting ---
+
+const highlightCache = new Map<string, ThemedToken[]>();
+
+function getCachedTokens(
+  highlighter: Highlighter,
+  content: string,
+  lang: BundledLanguage | undefined,
+): ThemedToken[] | null {
+  const key = `${lang ?? ""}:${content}`;
+  const cached = highlightCache.get(key);
+  if (cached) return cached;
+  try {
+    const result = highlighter.codeToTokens(content, { lang, theme: "rose-pine" });
+    const tokens = result.tokens[0] ?? null;
+    if (tokens) highlightCache.set(key, tokens);
+    return tokens;
+  } catch {
+    return null;
+  }
+}
+
+function useLazyVisible(ref: React.RefObject<HTMLElement | null>): boolean {
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref]);
+  return visible;
+}
+
 // --- Pending inline comments ---
 
 interface PendingComment {
   id: number;
   path: string;
   line: number;
+  startLine?: number;
   side: "LEFT" | "RIGHT";
   body: string;
 }
 
 let pendingIdCounter = 0;
+
+function isTestFile(filename: string): boolean {
+  const name = filename.includes("/") ? filename.slice(filename.lastIndexOf("/") + 1) : filename;
+  const dir = filename.toLowerCase();
+  return /\.(test|spec|e2e)\.[^.]+$/.test(name)
+    || /__(tests|mocks|snapshots)__/.test(dir)
+    || dir.includes("/test/") || dir.includes("/tests/")
+    || dir.startsWith("test/") || dir.startsWith("tests/");
+}
 
 // --- Main component ---
 
@@ -200,6 +272,8 @@ export function Review() {
     loadReviewed(owner!, repo!, number!),
   );
   const [stickyBodyExpanded, setStickyBodyExpanded] = useState(false);
+  const [descCollapsed, setDescCollapsed] = useState(false);
+  const [commitsCollapsed, setCommitsCollapsed] = useState(false);
   const [viewMode, setViewMode] = useState<"unified" | "split">(
     () => (localStorage.getItem("bearing:viewMode") as "unified" | "split") ?? "unified",
   );
@@ -211,12 +285,22 @@ export function Review() {
   const [sidebarOpen, setSidebarOpen] = useState(
     () => localStorage.getItem("bearing:sidebarOpen") !== "false",
   );
-  const [hiddenParticipants, setHiddenParticipants] = useState<Set<string>>(new Set());
+  const [fileSidebarOpen, setFileSidebarOpen] = useState(
+    () => localStorage.getItem("bearing:fileSidebarOpen") !== "false",
+  );
+  const [hideTests, setHideTests] = useState(
+    () => localStorage.getItem("bearing:hideTests") === "true",
+  );
+  const [hiddenParticipants, setHiddenParticipants] = useState<Set<string>>(() =>
+    loadHidden(owner!, repo!, number!),
+  );
   const [pendingComments, setPendingComments] = useState<PendingComment[]>([]);
-  const [activeCommentLine, setActiveCommentLine] = useState<{ path: string; line: number; side: "LEFT" | "RIGHT" } | null>(null);
+  const [activeCommentLine, setActiveCommentLine] = useState<{ path: string; line: number; startLine?: number; side: "LEFT" | "RIGHT" } | null>(null);
   const hoveredThreadRef = useRef<number | null>(null);
   const hoveredFileRef = useRef<string | null>(null);
   const headerSentinelRef = useRef<HTMLDivElement>(null);
+  const descSentinelRef = useRef<HTMLDivElement>(null);
+  const [descriptionScrolled, setDescriptionScrolled] = useState(false);
   const mainScrollRef = useRef<HTMLDivElement>(null);
   const highlighter = useHighlighter();
 
@@ -260,8 +344,8 @@ export function Review() {
     });
   }, []);
 
-  const addPendingComment = useCallback((path: string, line: number, side: "LEFT" | "RIGHT", body: string) => {
-    setPendingComments((prev) => [...prev, { id: ++pendingIdCounter, path, line, side, body }]);
+  const addPendingComment = useCallback((path: string, line: number, side: "LEFT" | "RIGHT", body: string, startLine?: number) => {
+    setPendingComments((prev) => [...prev, { id: ++pendingIdCounter, path, line, side, body, startLine }]);
     setActiveCommentLine(null);
   }, []);
 
@@ -283,18 +367,40 @@ export function Review() {
   );
 
   useEffect(() => {
-    const el = headerSentinelRef.current;
-    if (!el) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        const pinned = !entry.isIntersecting;
-        setHeaderPinned(pinned);
-        if (!pinned) setStickyBodyExpanded(false);
-      },
-      { threshold: 0 },
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
+    const root = mainScrollRef.current;
+    if (!root) return;
+
+    const observers: IntersectionObserver[] = [];
+
+    const titleEl = headerSentinelRef.current;
+    if (titleEl) {
+      const titleObserver = new IntersectionObserver(
+        ([entry]) => {
+          const pinned = !entry.isIntersecting && entry.boundingClientRect.top < entry.rootBounds!.top;
+          setHeaderPinned(pinned);
+          if (!pinned) setStickyBodyExpanded(false);
+        },
+        { threshold: 0, root },
+      );
+      titleObserver.observe(titleEl);
+      observers.push(titleObserver);
+    }
+
+    const descEl = descSentinelRef.current;
+    if (descEl) {
+      const descObserver = new IntersectionObserver(
+        ([entry]) => {
+          const scrolled = !entry.isIntersecting && entry.boundingClientRect.top < entry.rootBounds!.top;
+          setDescriptionScrolled(scrolled);
+          if (!scrolled) setStickyBodyExpanded(false);
+        },
+        { threshold: 0, root },
+      );
+      descObserver.observe(descEl);
+      observers.push(descObserver);
+    }
+
+    return () => observers.forEach((o) => o.disconnect());
   }, [data]);
 
   useEffect(() => {
@@ -328,6 +434,11 @@ export function Review() {
           delete next[filename];
         } else {
           next[filename] = sha;
+          setCollapsed((c) => {
+            const s = new Set(c);
+            s.add(filename);
+            return s;
+          });
         }
         saveReviewed(owner!, repo!, number!, next);
         return next;
@@ -362,6 +473,10 @@ export function Review() {
   }
 
   const threads = buildThreads(data.comments);
+
+  const visibleFiles = hideTests ? data.files.filter((f) => !isTestFile(f.filename)) : data.files;
+  const testFileCount = data.files.length - data.files.filter((f) => !isTestFile(f.filename)).length;
+
   const reviewedCount = data.files.filter(
     (f) => reviewed[f.filename] === f.sha,
   ).length;
@@ -369,23 +484,38 @@ export function Review() {
   return (
     <div className="h-full flex">
       {/* File list sidebar */}
+      {fileSidebarOpen && (
       <div className="w-[26rem] shrink-0 border-r border-bearing-border overflow-y-auto bg-bearing-bg">
-        <div className="px-3 py-2 border-b border-bearing-border/50">
+        <div className="px-3 py-2 border-b border-bearing-border/50 flex items-center gap-2">
           <span className="text-xs font-mono text-bearing-muted">
             {reviewedCount}/{data.files.length} files reviewed
           </span>
+          <span className="flex-1" />
+          {testFileCount > 0 && (
+            <button
+              onClick={() => {
+                setHideTests((v) => {
+                  localStorage.setItem("bearing:hideTests", String(!v));
+                  return !v;
+                });
+              }}
+              className={`text-[10px] font-mono shrink-0 ${hideTests ? "text-bearing-accent" : "text-bearing-muted"} hover:text-bearing-text`}
+            >
+              {hideTests ? `[show tests (${testFileCount})]` : "[hide tests]"}
+            </button>
+          )}
         </div>
         <div className="py-1">
           {(() => {
             const nameCount = new Map<string, number>();
-            for (const f of data.files) {
+            for (const f of visibleFiles) {
               const name = f.filename.includes("/")
                 ? f.filename.slice(f.filename.lastIndexOf("/") + 1)
                 : f.filename;
               nameCount.set(name, (nameCount.get(name) ?? 0) + 1);
             }
 
-            return data.files.map((file) => {
+            return visibleFiles.map((file) => {
               const isReviewed = reviewed[file.filename] === file.sha;
               const shortName = file.filename.includes("/")
                 ? file.filename.slice(file.filename.lastIndexOf("/") + 1)
@@ -435,22 +565,24 @@ export function Review() {
           })()}
         </div>
       </div>
+      )}
 
       {/* Main content */}
       <div ref={mainScrollRef} className="flex-1 overflow-y-auto min-w-0 relative">
         {/* Sticky bar — appears when header scrolls out */}
         {headerPinned && (
           <div className="sticky top-0 z-20">
-            <div className="bg-bearing-surface border-x border-b border-bearing-border rounded-b-lg">
+            <div className="bg-bearing-surface border-x border-b border-bearing-border rounded-b-lg border-l-4" style={{ borderLeftColor: getPRStatusColor(data.state, data.draft, data.reviews) }}>
               <div className="flex items-center gap-2 px-6 h-10">
-                <span className="text-xs font-mono text-bearing-muted truncate">
+                <span className="text-xs font-mono text-bearing-text truncate">
                   {data.title}
                 </span>
+                <PRStatusBadge state={data.state} draft={data.draft} reviews={data.reviews} />
                 <span className="flex-1" />
                 <span className="text-xs font-mono text-bearing-muted shrink-0">
                   {reviewedCount}/{data.files.length}
                 </span>
-                {data.body && (
+                {descriptionScrolled && data.body && (
                   <button
                     onClick={() => setStickyBodyExpanded((v) => !v)}
                     className="text-[10px] font-mono text-bearing-muted hover:text-bearing-text shrink-0"
@@ -470,7 +602,7 @@ export function Review() {
 
         <div className="px-4 pt-4 pb-8 space-y-3">
         {/* Header */}
-        <div className="border border-bearing-border rounded-lg bg-bearing-surface px-5 py-4">
+        <div ref={headerSentinelRef} className="border border-bearing-border rounded-lg bg-bearing-surface px-5 py-4 border-l-4" style={{ borderLeftColor: getPRStatusColor(data.state, data.draft, data.reviews) }}>
           <div className="flex items-center gap-2">
             <span className="text-xs font-mono text-bearing-muted">
               {owner}/{repo} #{number}
@@ -504,26 +636,46 @@ export function Review() {
 
         </div>
 
-        {/* PR Body */}
-        {data.body && (
-          <div className="border border-bearing-border rounded-lg bg-bearing-surface px-5 py-4 prose-bearing">
-            <Markdown>{data.body}</Markdown>
+        {data.truncated.length > 0 && (
+          <div className="px-4 py-2 rounded-lg border border-bearing-yellow/30 bg-bearing-yellow/5 text-[10px] font-mono text-bearing-yellow">
+            truncated: {data.truncated.join(", ")} (100 item limit)
           </div>
         )}
-        <div ref={headerSentinelRef} />
+
+        {/* PR Body */}
+        {data.body && (
+          <div className="border border-bearing-border rounded-lg bg-bearing-surface overflow-hidden">
+            <div
+              className="px-5 py-2 cursor-pointer flex items-center gap-2"
+              onClick={() => setDescCollapsed((v) => !v)}
+            >
+              <span className="text-xs text-bearing-muted shrink-0">{descCollapsed ? "▸" : "▾"}</span>
+              <span className="text-xs font-mono text-bearing-muted">description</span>
+            </div>
+            {!descCollapsed && (
+              <div className="px-5 pb-4 prose-bearing border-t border-bearing-border/50">
+                <Markdown>{data.body}</Markdown>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Commits */}
         {data.commits.length > 0 && (
-          <div className="border border-bearing-border rounded-lg bg-bearing-surface overflow-hidden">
-            <div className="px-5 py-2 border-b border-bearing-border/50">
+          <div ref={descSentinelRef} className="border border-bearing-border rounded-lg bg-bearing-surface overflow-hidden">
+            <div
+              className="px-5 py-2 cursor-pointer flex items-center gap-2"
+              onClick={() => setCommitsCollapsed((v) => !v)}
+            >
+              <span className="text-xs text-bearing-muted shrink-0">{commitsCollapsed ? "▸" : "▾"}</span>
               <span className="text-xs font-mono text-bearing-muted">
                 {data.commits.length} commit{data.commits.length !== 1 ? "s" : ""}
               </span>
             </div>
-            {data.commits.map((commit, i) => (
+            {!commitsCollapsed && data.commits.map((commit, i) => (
               <div
                 key={commit.sha}
-                className={`flex items-baseline gap-3 px-5 py-2.5 ${i > 0 ? "border-t border-bearing-border/50" : ""}`}
+                className={`flex items-baseline gap-3 px-5 py-2.5 border-t border-bearing-border/50`}
               >
                 <span className="text-xs font-mono text-bearing-muted/50 shrink-0">
                   {commit.sha.slice(0, 7)}
@@ -546,16 +698,27 @@ export function Review() {
         {/* File controls */}
         <div className="flex items-center gap-2">
           <button
+            onClick={() => {
+              setFileSidebarOpen((v) => {
+                localStorage.setItem("bearing:fileSidebarOpen", String(!v));
+                return !v;
+              });
+            }}
+            className={`text-[10px] font-mono ${fileSidebarOpen ? "text-bearing-accent" : "text-bearing-muted"} hover:text-bearing-text`}
+          >
+            [files]
+          </button>
+          <button
             onClick={expandAll}
             className="text-[10px] font-mono text-bearing-muted hover:text-bearing-text"
           >
-            expand all
+            [expand all]
           </button>
           <button
             onClick={collapseAll}
             className="text-[10px] font-mono text-bearing-muted hover:text-bearing-text"
           >
-            collapse all
+            [collapse all]
           </button>
           <span className="flex-1" />
           <button
@@ -564,18 +727,19 @@ export function Review() {
             }
             className="text-[10px] font-mono text-bearing-muted hover:text-bearing-text"
           >
-            {viewMode === "unified" ? "split" : "unified"}
+            [{viewMode === "unified" ? "split" : "unified"}]
           </button>
           <button
             onClick={toggleSidebar}
             className={`text-[10px] font-mono ${sidebarOpen ? "text-bearing-accent" : "text-bearing-muted"} hover:text-bearing-text`}
           >
-            comments
+            [comments]
           </button>
         </div>
 
         {/* Files */}
-        {data.files.map((file) => (
+        <div className="border border-bearing-border/40 rounded-lg p-3 space-y-2">
+        {visibleFiles.map((file) => (
           <FileSection
             key={file.filename}
             file={file}
@@ -586,8 +750,16 @@ export function Review() {
             viewMode={viewMode}
             pendingComments={pendingComments.filter((c) => c.path === file.filename)}
             activeCommentLine={activeCommentLine?.path === file.filename ? activeCommentLine : null}
-            onLineClick={(line, side) => setActiveCommentLine({ path: file.filename, line, side })}
-            onAddComment={(line, side, body) => addPendingComment(file.filename, line, side, body)}
+            onLineClick={(line, side, shiftKey) => {
+              if (shiftKey && activeCommentLine && activeCommentLine.path === file.filename && activeCommentLine.side === side) {
+                const startLine = Math.min(activeCommentLine.line, line);
+                const endLine = Math.max(activeCommentLine.line, line);
+                setActiveCommentLine({ path: file.filename, line: endLine, startLine, side });
+              } else {
+                setActiveCommentLine({ path: file.filename, line, side });
+              }
+            }}
+            onAddComment={(line, side, body, startLine) => addPendingComment(file.filename, line, side, body, startLine)}
             onCancelComment={() => setActiveCommentLine(null)}
             onRemovePendingComment={removePendingComment}
             onToggleCollapse={() => toggleCollapse(file.filename)}
@@ -595,6 +767,24 @@ export function Review() {
             onHoverThread={hoverThread}
           />
         ))}
+        </div>
+
+        {/* Signals + Merge */}
+        {(data.checkRuns.length > 0 || (data.state === "open" && data.allowedMergeMethods.length > 0)) && (
+          <SignalsCard
+            checkRuns={data.checkRuns}
+            mergeable={data.mergeable}
+            mergeableState={data.mergeableState}
+            showMerge={data.state === "open" && data.allowedMergeMethods.length > 0}
+            allowedMergeMethods={data.allowedMergeMethods}
+            owner={owner!}
+            repo={repo!}
+            number={parseInt(number!, 10)}
+            onMerged={() => {
+              fetchPRDetail(owner!, repo!, parseInt(number!, 10)).then(setData);
+            }}
+          />
+        )}
 
         {/* Activity timeline — shown when sidebar is closed */}
         {!sidebarOpen &&
@@ -628,6 +818,7 @@ export function Review() {
                 const next = new Set(prev);
                 if (next.has(login)) next.delete(login);
                 else next.add(login);
+                saveHidden(owner!, repo!, number!, next);
                 return next;
               });
             }}
@@ -639,6 +830,7 @@ export function Review() {
                 } else {
                   for (const l of botLogins) next.add(l);
                 }
+                saveHidden(owner!, repo!, number!, next);
                 return next;
               });
             }}
@@ -987,6 +1179,7 @@ function ReviewForm({
       const comments = pendingComments.map((c) => ({
         path: c.path,
         line: c.line,
+        ...(c.startLine != null ? { start_line: c.startLine } : {}),
         side: c.side,
         body: c.body,
       }));
@@ -1019,16 +1212,14 @@ function ReviewForm({
         disabled={submitting}
       />
       <div className="flex items-center gap-2 mt-2">
-        <select
+        <Picker
           value={event}
-          onChange={(e) => setEvent(e.target.value as typeof event)}
-          className="text-[10px] font-mono px-2 py-1 rounded border border-bearing-border bg-bearing-overlay text-bearing-text focus:outline-none focus:border-bearing-accent"
-          disabled={submitting}
-        >
-          <option value="COMMENT">comment</option>
-          {!isAuthor && <option value="APPROVE">approve</option>}
-          {!isAuthor && <option value="REQUEST_CHANGES">request changes</option>}
-        </select>
+          options={isAuthor ? ["COMMENT"] : ["COMMENT", "APPROVE", "REQUEST_CHANGES"]}
+          labels={{ COMMENT: "comment", APPROVE: "approve", REQUEST_CHANGES: "request changes" }}
+          colorMap={{ APPROVE: "text-bearing-cyan", REQUEST_CHANGES: "text-bearing-yellow" }}
+          onChange={setEvent}
+          popDirection="up"
+        />
         {pendingComments.length > 0 && (
           <span className="text-[10px] font-mono text-bearing-yellow">
             {pendingComments.length} inline
@@ -1192,6 +1383,29 @@ function SidebarThreadCard({
   );
 }
 
+function getPRStatusColor(
+  state: "open" | "closed" | "merged",
+  draft: boolean,
+  reviews: PullRequestReview[],
+): string {
+  if (state === "merged") return "#c4a7e7";
+  if (state === "closed") return "#eb6f92";
+  if (draft) return "#6e6a86";
+
+  const latestByAuthor = new Map<string, PullRequestReview>();
+  for (const r of reviews) {
+    if (r.state === "PENDING" || r.state === "COMMENTED" || r.state === "DISMISSED") continue;
+    const existing = latestByAuthor.get(r.author.login);
+    if (!existing || new Date(r.submittedAt) > new Date(existing.submittedAt)) {
+      latestByAuthor.set(r.author.login, r);
+    }
+  }
+
+  if ([...latestByAuthor.values()].some((r) => r.state === "CHANGES_REQUESTED")) return "#f6c177";
+  if ([...latestByAuthor.values()].some((r) => r.state === "APPROVED")) return "#9ccfd8";
+  return "#f6c177";
+}
+
 function PRStatusBadge({
   state,
   draft,
@@ -1232,6 +1446,324 @@ function PRStatusBadge({
 
   return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-bearing-yellow/10 text-bearing-yellow/70 border border-bearing-yellow/20 shrink-0">review pending</span>;
 }
+
+// --- Signals Card ---
+
+function SignalsGroup({
+  label,
+  runs,
+  color,
+}: {
+  label: string;
+  runs: CheckRun[];
+  color: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  if (runs.length === 0) return null;
+
+  return (
+    <div className="border-t border-bearing-border/50">
+      <div
+        className="px-5 py-2 cursor-pointer flex items-center gap-2"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="text-xs text-bearing-muted shrink-0">{expanded ? "▾" : "▸"}</span>
+        <span className={`text-xs font-mono ${color}`}>
+          {runs.length} {label}
+        </span>
+      </div>
+      {expanded && runs.map((cr) => (
+        <CheckRunRow key={cr.id} run={cr} />
+      ))}
+    </div>
+  );
+}
+
+function SignalsCard({
+  checkRuns,
+  mergeable,
+  showMerge,
+  allowedMergeMethods,
+  owner,
+  repo,
+  number,
+  onMerged,
+}: {
+  checkRuns: CheckRun[];
+  mergeable: boolean | null;
+  mergeableState: string;
+  showMerge: boolean;
+  allowedMergeMethods: ("merge" | "squash" | "rebase")[];
+  owner: string;
+  repo: string;
+  number: number;
+  onMerged: () => void;
+}) {
+  const passed = checkRuns.filter((c) => c.status === "completed" && (c.conclusion === "success" || c.conclusion === "neutral"));
+  const failed = checkRuns.filter((c) => c.status === "completed" && (c.conclusion === "failure" || c.conclusion === "timed_out" || c.conclusion === "action_required"));
+  const skipped = checkRuns.filter((c) => c.status === "completed" && (c.conclusion === "skipped" || c.conclusion === "cancelled"));
+  const pending = checkRuns.filter((c) => c.status !== "completed");
+
+  const hasMergeConflicts = mergeable === false;
+  const hasFailures = failed.length > 0;
+
+  const [method, setMethod] = useState<"merge" | "squash" | "rebase" | "close">(() => {
+    const saved = localStorage.getItem(`bearing:mergeMethod:${owner}/${repo}`);
+    if (saved && allowedMergeMethods.includes(saved as any)) return saved as any;
+    return allowedMergeMethods[0] ?? "merge";
+  });
+  const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [commitMessage, setCommitMessage] = useState("");
+  const [forceWithFailures, setForceWithFailures] = useState(false);
+
+  const isClose = method === "close";
+  const needsCommitMessage = method === "merge" || method === "squash";
+  const canMerge = isClose || (mergeable === true && (!hasFailures || forceWithFailures));
+
+  const handleMerge = useCallback(async () => {
+    setMerging(true);
+    setMergeError(null);
+    try {
+      if (isClose) {
+        await closePR(owner, repo, number);
+      } else {
+        await mergePR(owner, repo, number, method as "merge" | "squash" | "rebase", commitMessage || undefined);
+        localStorage.setItem(`bearing:mergeMethod:${owner}/${repo}`, method);
+      }
+      setConfirmOpen(false);
+      setCommitMessage("");
+      onMerged();
+    } catch (err) {
+      setMergeError(err instanceof Error ? err.message : "Failed");
+    } finally {
+      setMerging(false);
+    }
+  }, [owner, repo, number, method, commitMessage, isClose, onMerged]);
+
+  return (
+    <div className="border border-bearing-border rounded-lg bg-bearing-surface">
+      {checkRuns.length > 0 && (
+        <>
+          <div className="px-5 py-2 flex items-center gap-3">
+            <span className="text-xs font-mono text-bearing-muted">signals</span>
+            <span className="flex-1" />
+            {pending.length > 0 && (
+              <span className="text-[10px] font-mono text-bearing-yellow">{pending.length} pending</span>
+            )}
+          </div>
+          <SignalsGroup label="failed" runs={failed} color="text-bearing-red" />
+          <SignalsGroup label="passed" runs={passed} color="text-bearing-cyan" />
+          <SignalsGroup label="skipped" runs={skipped} color="text-bearing-muted" />
+        </>
+      )}
+      <div className="border-t border-bearing-border/50 px-5 py-2 flex items-center gap-2">
+        <span className={`text-xs font-mono ${hasMergeConflicts ? "text-bearing-red" : mergeable === null ? "text-bearing-yellow" : "text-bearing-cyan"}`}>
+          {hasMergeConflicts ? "✗ merge conflicts" : mergeable === null ? "● checking mergeability…" : "✓ no conflicts"}
+        </span>
+      </div>
+      {showMerge && (
+        <div className="border-t border-bearing-border/50 px-5 py-3">
+          {!confirmOpen ? (
+            <div className="flex items-center gap-2">
+              {hasFailures && mergeable === true && (
+                <button
+                  onClick={() => setForceWithFailures((v) => !v)}
+                  className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors ${
+                    forceWithFailures
+                      ? "border-bearing-yellow/50 text-bearing-yellow"
+                      : "border-bearing-border text-bearing-muted hover:text-bearing-yellow hover:border-bearing-yellow/30"
+                  }`}
+                >
+                  merge with failing signals
+                </button>
+              )}
+              <span className="flex-1" />
+              <Picker
+                value={method}
+                options={[...allowedMergeMethods, "close"]}
+                labels={MERGE_LABELS}
+                colorMap={{ close: "text-bearing-red" }}
+                onChange={setMethod}
+                popDirection="up"
+              />
+              <button
+                onClick={() => setConfirmOpen(true)}
+                disabled={!canMerge}
+                className={`text-xs font-mono px-3 py-1 rounded border disabled:opacity-40 disabled:cursor-not-allowed ${
+                  isClose
+                    ? "border-bearing-red/50 text-bearing-red hover:border-bearing-red"
+                    : "border-bearing-cyan/50 text-bearing-cyan hover:border-bearing-cyan"
+                }`}
+              >
+                {MERGE_LABELS[method] ?? method}
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <span className={`text-xs font-mono ${isClose ? "text-bearing-red" : "text-bearing-yellow"}`}>
+                  {MERGE_LABELS[method] ?? method}?
+                </span>
+              </div>
+              {needsCommitMessage && (
+                <textarea
+                  value={commitMessage}
+                  onChange={(e) => setCommitMessage(e.target.value)}
+                  placeholder="Commit message (optional)"
+                  className="w-full bg-bearing-overlay border border-bearing-border rounded px-2 py-1.5 text-xs font-mono text-bearing-text placeholder:text-bearing-muted/50 resize-none focus:outline-none focus:border-bearing-accent"
+                  rows={2}
+                  disabled={merging}
+                />
+              )}
+              <div className="flex items-center gap-2">
+                <span className="flex-1" />
+                <button
+                  onClick={() => { setConfirmOpen(false); setCommitMessage(""); setMergeError(null); }}
+                  disabled={merging}
+                  className="text-[10px] font-mono px-2 py-1 text-bearing-muted hover:text-bearing-text"
+                >
+                  cancel
+                </button>
+                <button
+                  onClick={handleMerge}
+                  disabled={merging}
+                  className={`text-xs font-mono px-3 py-1 rounded border disabled:opacity-40 ${
+                    isClose
+                      ? "border-bearing-red/50 text-bearing-red hover:border-bearing-red"
+                      : "border-bearing-cyan/50 text-bearing-cyan hover:border-bearing-cyan"
+                  }`}
+                >
+                  {merging ? (isClose ? "closing…" : "merging…") : "confirm"}
+                </button>
+              </div>
+              {mergeError && (
+                <div className="text-[10px] font-mono text-bearing-red mt-1 truncate">
+                  {mergeError}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const CHECK_CONCLUSION_COLOR: Record<string, string> = {
+  success: "text-bearing-cyan",
+  failure: "text-bearing-red",
+  cancelled: "text-bearing-muted",
+  skipped: "text-bearing-muted",
+  neutral: "text-bearing-muted",
+  timed_out: "text-bearing-red",
+  action_required: "text-bearing-yellow",
+};
+
+const CHECK_CONCLUSION_LABEL: Record<string, string> = {
+  success: "✓",
+  failure: "✗",
+  cancelled: "⊘",
+  skipped: "−",
+  neutral: "−",
+  timed_out: "✗",
+  action_required: "!",
+};
+
+function CheckRunRow({ run }: { run: CheckRun }) {
+  const isComplete = run.status === "completed";
+  const color = isComplete
+    ? CHECK_CONCLUSION_COLOR[run.conclusion ?? ""] ?? "text-bearing-muted"
+    : "text-bearing-yellow";
+  const label = isComplete
+    ? CHECK_CONCLUSION_LABEL[run.conclusion ?? ""] ?? "?"
+    : "●";
+
+  return (
+    <a
+      href={run.htmlUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="flex items-center gap-3 px-5 py-1.5 hover:bg-bearing-overlay/30 transition-colors"
+    >
+      <span className={`text-xs font-mono w-4 text-center ${color}`}>{label}</span>
+      <span className="text-xs font-mono text-bearing-text truncate">{run.name}</span>
+    </a>
+  );
+}
+
+function Picker({
+  value,
+  options,
+  labels,
+  onChange,
+  popDirection = "up",
+  colorMap,
+}: {
+  value: string;
+  options: string[];
+  labels?: Record<string, string>;
+  onChange: (v: any) => void;
+  popDirection?: "up" | "down";
+  colorMap?: Record<string, string>;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [open]);
+
+  const display = labels?.[value] ?? value;
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="text-[10px] font-mono text-bearing-muted hover:text-bearing-text"
+      >
+        [{display}]
+      </button>
+      {open && (
+        <div className={`absolute right-0 z-20 bg-bearing-surface border border-bearing-border rounded shadow-lg py-1 min-w-[180px] ${
+          popDirection === "up" ? "bottom-full mb-1" : "top-full mt-1"
+        }`}>
+          {options.map((opt) => {
+            const active = opt === value;
+            const color = colorMap?.[opt];
+            return (
+              <button
+                key={opt}
+                onClick={() => { onChange(opt); setOpen(false); }}
+                className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs font-mono hover:bg-bearing-overlay text-left ${
+                  active ? (color ?? "text-bearing-accent") : "text-bearing-text"
+                }`}
+              >
+                <span className={`text-[10px] ${active ? (color ?? "text-bearing-accent") : "text-bearing-muted"}`}>
+                  {active ? "●" : "○"}
+                </span>
+                {labels?.[opt] ?? opt}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const MERGE_LABELS: Record<string, string> = {
+  merge: "merge commit",
+  squash: "squash and merge",
+  rebase: "rebase and merge",
+  close: "close",
+};
 
 // --- Activity Timeline (fallback when sidebar closed) ---
 
@@ -1380,9 +1912,9 @@ function FileSection({
   highlighter: Highlighter | null;
   viewMode: "unified" | "split";
   pendingComments: PendingComment[];
-  activeCommentLine: { path: string; line: number; side: "LEFT" | "RIGHT" } | null;
-  onLineClick: (line: number, side: "LEFT" | "RIGHT") => void;
-  onAddComment: (line: number, side: "LEFT" | "RIGHT", body: string) => void;
+  activeCommentLine: { path: string; line: number; startLine?: number; side: "LEFT" | "RIGHT" } | null;
+  onLineClick: (line: number, side: "LEFT" | "RIGHT", shiftKey: boolean) => void;
+  onAddComment: (line: number, side: "LEFT" | "RIGHT", body: string, startLine?: number) => void;
   onCancelComment: () => void;
   onRemovePendingComment: (id: number) => void;
   onToggleCollapse: () => void;
@@ -1505,9 +2037,9 @@ function HunkView({
   path: string;
   threads: CommentThread[];
   pendingComments: PendingComment[];
-  activeCommentLine: { path: string; line: number; side: "LEFT" | "RIGHT" } | null;
-  onLineClick: (line: number, side: "LEFT" | "RIGHT") => void;
-  onAddComment: (line: number, side: "LEFT" | "RIGHT", body: string) => void;
+  activeCommentLine: { path: string; line: number; startLine?: number; side: "LEFT" | "RIGHT" } | null;
+  onLineClick: (line: number, side: "LEFT" | "RIGHT", shiftKey: boolean) => void;
+  onAddComment: (line: number, side: "LEFT" | "RIGHT", body: string, startLine?: number) => void;
   onCancelComment: () => void;
   onRemovePendingComment: (id: number) => void;
   highlighter: Highlighter | null;
@@ -1534,11 +2066,28 @@ function HunkView({
 
             const commentLine = line.type === "deletion" ? line.oldLine : line.newLine;
             const commentSide: "LEFT" | "RIGHT" = line.type === "deletion" ? "LEFT" : "RIGHT";
+
+            const inThreadRange = commentLine != null && threads.some((t) => {
+              if (t.root.line === null) return false;
+              const tStart = t.root.startLine ?? t.root.line;
+              const tEnd = t.root.line;
+              if (t.root.side === "LEFT" && commentSide === "LEFT")
+                return commentLine >= tStart && commentLine <= tEnd;
+              if (t.root.side !== "LEFT" && commentSide === "RIGHT")
+                return commentLine >= tStart && commentLine <= tEnd;
+              return false;
+            });
             const linePending = commentLine != null
               ? pendingComments.filter((c) => c.line === commentLine && c.side === commentSide)
               : [];
-            const isActive = activeCommentLine != null && commentLine != null
-              && activeCommentLine.line === commentLine && activeCommentLine.side === commentSide;
+            const rangeStart = activeCommentLine?.startLine ?? activeCommentLine?.line;
+            const rangeEnd = activeCommentLine?.line;
+            const isInRange = activeCommentLine != null && commentLine != null
+              && activeCommentLine.side === commentSide
+              && rangeStart != null && rangeEnd != null
+              && commentLine >= rangeStart && commentLine <= rangeEnd;
+            const isRangeEnd = isInRange && commentLine === rangeEnd;
+            const isRangeStart = isInRange && commentLine === rangeStart;
 
             return (
               <Fragment key={i}>
@@ -1546,11 +2095,16 @@ function HunkView({
                   line={line}
                   lang={lang}
                   highlighter={highlighter}
-                  onClickLine={commentLine != null ? () => onLineClick(commentLine, commentSide) : undefined}
+                  highlighted={isInRange}
+                  highlightedFirst={isRangeStart}
+                  threadBorder={inThreadRange || lineThreads.length > 0}
+                  commentLine={commentLine}
+                  commentSide={commentSide}
+                  onLineClick={onLineClick}
                 />
                 {lineThreads.map((thread) => (
                   <tr key={thread.root.id}>
-                    <td colSpan={4} className="p-0">
+                    <td colSpan={4} className="p-0 border-l-2 border-l-bearing-subtle">
                       <ThreadView thread={thread} onHover={onHoverThread} />
                     </td>
                   </tr>
@@ -1562,11 +2116,13 @@ function HunkView({
                     </td>
                   </tr>
                 ))}
-                {isActive && (
+                {isRangeEnd && (
                   <tr>
-                    <td colSpan={4} className="p-0">
+                    <td colSpan={4} className="p-0 border-l-2 border-l-bearing-subtle">
                       <InlineCommentForm
-                        onSubmit={(body) => onAddComment(commentLine!, commentSide, body)}
+                        line={commentLine!}
+                        startLine={activeCommentLine!.startLine}
+                        onSubmit={(body) => onAddComment(commentLine!, commentSide, body, activeCommentLine!.startLine)}
                         onCancel={onCancelComment}
                       />
                     </td>
@@ -1606,46 +2162,52 @@ const PREFIX_COLOR: Record<string, string> = {
   context: "text-bearing-muted/40",
 };
 
-function DiffLineRow({
+const DiffLineRow = memo(function DiffLineRow({
   line,
   lang,
   highlighter,
-  onClickLine,
+  highlighted,
+  highlightedFirst,
+  threadBorder,
+  commentLine,
+  commentSide,
+  onLineClick,
 }: {
   line: DiffLine;
   lang: BundledLanguage | undefined;
   highlighter: Highlighter | null;
-  onClickLine?: () => void;
+  highlighted?: boolean;
+  highlightedFirst?: boolean;
+  threadBorder?: boolean;
+  commentLine: number | null;
+  commentSide: "LEFT" | "RIGHT";
+  onLineClick: (line: number, side: "LEFT" | "RIGHT", shiftKey: boolean) => void;
 }) {
-  let tokens: ThemedToken[] | null = null;
-  if (highlighter && line.content) {
-    try {
-      const result = highlighter.codeToTokens(line.content, {
-        lang,
-        theme: "rose-pine",
-      });
-      tokens = result.tokens[0] ?? null;
-    } catch {
-      // unsupported lang, fall back to plain text
-    }
-  }
+  const rowRef = useRef<HTMLTableRowElement>(null);
+  const visible = useLazyVisible(rowRef);
+
+  const tokens = visible && highlighter && line.content
+    ? getCachedTokens(highlighter, line.content, lang)
+    : null;
+
+  const clickable = commentLine != null;
 
   return (
-    <tr className={`${LINE_BG[line.type]} group/line`}>
+    <tr ref={rowRef} className={`${LINE_BG[line.type]} group/line ${""}`}>
       <td
-        className={`w-[1px] whitespace-nowrap text-right px-2 py-0 text-xs text-bearing-muted/40 select-none ${GUTTER_BG[line.type]} ${onClickLine ? "cursor-pointer hover:text-bearing-accent" : ""}`}
-        onClick={onClickLine}
+        className={`w-[1px] whitespace-nowrap text-right pl-4 pr-3 py-0 text-xs text-bearing-muted/40 select-none ${GUTTER_BG[line.type]} ${clickable ? "cursor-pointer hover:text-bearing-accent" : ""} ${highlighted || threadBorder ? "border-l-2 border-l-bearing-subtle" : ""}`}
+        onClick={clickable ? (e) => onLineClick(commentLine, commentSide, e.shiftKey) : undefined}
       >
         {line.oldLine ?? ""}
       </td>
       <td
-        className={`w-[1px] whitespace-nowrap text-right px-2 py-0 text-xs text-bearing-muted/40 select-none border-r border-bearing-border/20 ${GUTTER_BG[line.type]} ${onClickLine ? "cursor-pointer hover:text-bearing-accent" : ""}`}
-        onClick={onClickLine}
+        className={`w-[1px] whitespace-nowrap text-right px-2 py-0 text-xs text-bearing-muted/40 select-none border-r border-bearing-border/20 ${GUTTER_BG[line.type]} ${clickable ? "cursor-pointer hover:text-bearing-accent" : ""}`}
+        onClick={clickable ? (e) => onLineClick(commentLine, commentSide, e.shiftKey) : undefined}
       >
         {line.newLine ?? ""}
       </td>
       <td
-        className={`w-[1px] px-1 py-0 select-none ${PREFIX_COLOR[line.type]}`}
+        className={`w-[1px] px-3 py-0 select-none ${PREFIX_COLOR[line.type]}`}
       >
         {PREFIX_CHAR[line.type]}
       </td>
@@ -1664,7 +2226,7 @@ function DiffLineRow({
       </td>
     </tr>
   );
-}
+});
 
 // --- Split (side-by-side) view ---
 
@@ -1729,9 +2291,9 @@ function SplitHunkView({
   path: string;
   threads: CommentThread[];
   pendingComments: PendingComment[];
-  activeCommentLine: { path: string; line: number; side: "LEFT" | "RIGHT" } | null;
-  onLineClick: (line: number, side: "LEFT" | "RIGHT") => void;
-  onAddComment: (line: number, side: "LEFT" | "RIGHT", body: string) => void;
+  activeCommentLine: { path: string; line: number; startLine?: number; side: "LEFT" | "RIGHT" } | null;
+  onLineClick: (line: number, side: "LEFT" | "RIGHT", shiftKey: boolean) => void;
+  onAddComment: (line: number, side: "LEFT" | "RIGHT", body: string, startLine?: number) => void;
   onCancelComment: () => void;
   onRemovePendingComment: (id: number) => void;
   highlighter: Highlighter | null;
@@ -1772,12 +2334,33 @@ function SplitHunkView({
             const rightLine = row.right?.newLine ?? null;
             const leftPending = leftLine != null ? pendingComments.filter((c) => c.line === leftLine && c.side === "LEFT") : [];
             const rightPending = rightLine != null ? pendingComments.filter((c) => c.line === rightLine && c.side === "RIGHT") : [];
-            const leftActive = activeCommentLine != null && leftLine != null && activeCommentLine.line === leftLine && activeCommentLine.side === "LEFT";
-            const rightActive = activeCommentLine != null && rightLine != null && activeCommentLine.line === rightLine && activeCommentLine.side === "RIGHT";
+
+            const lRangeStart = activeCommentLine?.side === "LEFT" ? (activeCommentLine.startLine ?? activeCommentLine.line) : null;
+            const lRangeEnd = activeCommentLine?.side === "LEFT" ? activeCommentLine.line : null;
+            const rRangeStart = activeCommentLine?.side === "RIGHT" ? (activeCommentLine.startLine ?? activeCommentLine.line) : null;
+            const rRangeEnd = activeCommentLine?.side === "RIGHT" ? activeCommentLine.line : null;
+
+            const leftInRange = leftLine != null && lRangeStart != null && lRangeEnd != null && leftLine >= lRangeStart && leftLine <= lRangeEnd;
+            const rightInRange = rightLine != null && rRangeStart != null && rRangeEnd != null && rightLine >= rRangeStart && rightLine <= rRangeEnd;
+            const leftRangeEnd = leftInRange && leftLine === lRangeEnd;
+            const rightRangeEnd = rightInRange && rightLine === rRangeEnd;
+            const leftRangeStart = leftInRange && leftLine === lRangeStart;
+            const rightRangeStart = rightInRange && rightLine === rRangeStart;
+
+            const leftInThreadRange = leftLine != null && threads.some((t) => {
+              if (t.root.line === null || t.root.side !== "LEFT") return false;
+              const tStart = t.root.startLine ?? t.root.line;
+              return leftLine >= tStart && leftLine <= t.root.line;
+            });
+            const rightInThreadRange = rightLine != null && threads.some((t) => {
+              if (t.root.line === null || t.root.side === "LEFT") return false;
+              const tStart = t.root.startLine ?? t.root.line;
+              return rightLine >= tStart && rightLine <= t.root.line;
+            });
 
             const hasExtra = leftThreads.length > 0 || rightThreads.length > 0
               || leftPending.length > 0 || rightPending.length > 0
-              || leftActive || rightActive;
+              || leftRangeEnd || rightRangeEnd;
 
             return (
               <Fragment key={i}>
@@ -1786,35 +2369,46 @@ function SplitHunkView({
                   right={row.right}
                   lang={lang}
                   highlighter={highlighter}
-                  onClickLeft={leftLine != null ? () => onLineClick(leftLine, "LEFT") : undefined}
-                  onClickRight={rightLine != null ? () => onLineClick(rightLine, "RIGHT") : undefined}
+                  leftHighlighted={leftInRange}
+                  rightHighlighted={rightInRange}
+                  leftHighlightedFirst={leftRangeStart}
+                  rightHighlightedFirst={rightRangeStart}
+                  leftThreadBorder={leftInThreadRange}
+                  rightThreadBorder={rightInThreadRange}
+                  leftLine={leftLine}
+                  rightLine={rightLine}
+                  onLineClick={onLineClick}
                 />
                 {hasExtra && (
                   <tr>
-                    <td colSpan={3} className="p-0 align-top border-r border-bearing-border/30">
+                    <td colSpan={3} className={`p-0 align-top border-r border-bearing-border/30 ${leftRangeEnd || leftThreads.length > 0 ? "border-l-2 border-l-bearing-subtle" : ""}`}>
                       {leftThreads.map((thread) => (
                         <ThreadView key={thread.root.id} thread={thread} onHover={onHoverThread} />
                       ))}
                       {leftPending.map((pc) => (
                         <PendingCommentView key={`pending-${pc.id}`} comment={pc} onRemove={() => onRemovePendingComment(pc.id)} />
                       ))}
-                      {leftActive && (
+                      {leftRangeEnd && (
                         <InlineCommentForm
-                          onSubmit={(body) => onAddComment(leftLine!, "LEFT", body)}
+                          line={leftLine!}
+                          startLine={activeCommentLine!.startLine}
+                          onSubmit={(body) => onAddComment(leftLine!, "LEFT", body, activeCommentLine!.startLine)}
                           onCancel={onCancelComment}
                         />
                       )}
                     </td>
-                    <td colSpan={3} className="p-0 align-top">
+                    <td colSpan={3} className={`p-0 align-top ${rightRangeEnd || rightThreads.length > 0 ? "border-l-2 border-l-bearing-subtle" : ""}`}>
                       {rightThreads.map((thread) => (
                         <ThreadView key={thread.root.id} thread={thread} onHover={onHoverThread} />
                       ))}
                       {rightPending.map((pc) => (
                         <PendingCommentView key={`pending-${pc.id}`} comment={pc} onRemove={() => onRemovePendingComment(pc.id)} />
                       ))}
-                      {rightActive && (
+                      {rightRangeEnd && (
                         <InlineCommentForm
-                          onSubmit={(body) => onAddComment(rightLine!, "RIGHT", body)}
+                          line={rightLine!}
+                          startLine={activeCommentLine!.startLine}
+                          onSubmit={(body) => onAddComment(rightLine!, "RIGHT", body, activeCommentLine!.startLine)}
                           onCancel={onCancelComment}
                         />
                       )}
@@ -1830,53 +2424,82 @@ function SplitHunkView({
   );
 }
 
-function SplitDiffRow({
+const SplitDiffRow = memo(function SplitDiffRow({
   left,
   right,
   lang,
   highlighter,
-  onClickLeft,
-  onClickRight,
+  leftHighlighted,
+  rightHighlighted,
+  leftHighlightedFirst,
+  rightHighlightedFirst,
+  leftThreadBorder,
+  rightThreadBorder,
+  leftLine,
+  rightLine,
+  onLineClick,
 }: {
   left: DiffLine | null;
   right: DiffLine | null;
   lang: BundledLanguage | undefined;
   highlighter: Highlighter | null;
-  onClickLeft?: () => void;
-  onClickRight?: () => void;
+  leftHighlighted?: boolean;
+  rightHighlighted?: boolean;
+  leftHighlightedFirst?: boolean;
+  rightHighlightedFirst?: boolean;
+  leftThreadBorder?: boolean;
+  rightThreadBorder?: boolean;
+  leftLine: number | null;
+  rightLine: number | null;
+  onLineClick: (line: number, side: "LEFT" | "RIGHT", shiftKey: boolean) => void;
 }) {
   return (
     <tr>
-      <SplitHalf line={left} side="left" lang={lang} highlighter={highlighter} onClickLine={onClickLeft} />
+      <SplitHalf line={left} side="left" lang={lang} highlighter={highlighter} highlighted={leftHighlighted} highlightedFirst={leftHighlightedFirst} threadBorder={leftThreadBorder} commentLine={leftLine} onLineClick={onLineClick} />
       <SplitHalf
         line={right}
         side="right"
         lang={lang}
         highlighter={highlighter}
-        onClickLine={onClickRight}
+        highlighted={rightHighlighted}
+        highlightedFirst={rightHighlightedFirst}
+        threadBorder={rightThreadBorder}
+        commentLine={rightLine}
+        onLineClick={onLineClick}
       />
     </tr>
   );
-}
+});
 
-function SplitHalf({
+const SplitHalf = memo(function SplitHalf({
   line,
   side,
   lang,
   highlighter,
-  onClickLine,
+  highlighted,
+  highlightedFirst,
+  threadBorder,
+  commentLine,
+  onLineClick,
 }: {
   line: DiffLine | null;
   side: "left" | "right";
   lang: BundledLanguage | undefined;
   highlighter: Highlighter | null;
-  onClickLine?: () => void;
+  highlighted?: boolean;
+  highlightedFirst?: boolean;
+  threadBorder?: boolean;
+  commentLine: number | null;
+  onLineClick: (line: number, side: "LEFT" | "RIGHT", shiftKey: boolean) => void;
 }) {
+  const clickSide: "LEFT" | "RIGHT" = side === "left" ? "LEFT" : "RIGHT";
+  const clickable = commentLine != null;
+
   if (!line) {
     return (
       <>
-        <td className="w-[1px] px-2 py-0 bg-bearing-overlay/30 select-none" />
-        <td className="w-[1px] px-1 py-0 bg-bearing-overlay/30 select-none" />
+        <td className="w-[1px] pl-4 pr-3 py-0 bg-bearing-overlay/30 select-none" />
+        <td className="w-[1px] px-3 py-0 bg-bearing-overlay/30 select-none" />
         <td
           className={`w-1/2 py-0 bg-bearing-overlay/30 ${side === "left" ? "border-r border-bearing-border/30" : ""}`}
         />
@@ -1886,21 +2509,12 @@ function SplitHalf({
 
   const type = line.type === "context" ? "context" : line.type;
   const lineNum = side === "left" ? line.oldLine : line.newLine;
-  const bg = LINE_BG[type];
-  const gutterBg = GUTTER_BG[type];
+  const bg = highlighted ? "" : LINE_BG[type];
+  const gutterBg = highlighted ? "" : GUTTER_BG[type];
 
-  let tokens: ThemedToken[] | null = null;
-  if (highlighter && line.content) {
-    try {
-      const result = highlighter.codeToTokens(line.content, {
-        lang,
-        theme: "rose-pine",
-      });
-      tokens = result.tokens[0] ?? null;
-    } catch {
-      // fall back
-    }
-  }
+  const tokens = highlighter && line.content
+    ? getCachedTokens(highlighter, line.content, lang)
+    : null;
 
   const prefix =
     type === "deletion" ? "-" : type === "addition" ? "+" : " ";
@@ -1909,16 +2523,16 @@ function SplitHalf({
   return (
     <>
       <td
-        className={`w-[1px] whitespace-nowrap text-right px-2 py-0 text-xs text-bearing-muted/40 select-none ${gutterBg} ${onClickLine ? "cursor-pointer hover:text-bearing-accent" : ""}`}
-        onClick={onClickLine}
+        className={`w-[1px] whitespace-nowrap text-right pl-4 pr-3 py-0 text-xs text-bearing-muted/40 select-none ${gutterBg} ${clickable ? "cursor-pointer hover:text-bearing-accent" : ""} ${highlighted || threadBorder ? "border-l-2 border-l-bearing-subtle" : ""}`}
+        onClick={clickable ? (e) => onLineClick(commentLine, clickSide, e.shiftKey) : undefined}
       >
         {lineNum ?? ""}
       </td>
-      <td className={`w-[1px] px-1 py-0 select-none ${prefixColor} ${bg}`}>
+      <td className={`w-[1px] px-3 py-0 select-none ${prefixColor} ${bg} ${""}`}>
         {prefix}
       </td>
       <td
-        className={`w-1/2 py-0 pr-2 ${bg} ${side === "left" ? "border-r border-bearing-border/30" : ""}`}
+        className={`w-1/2 py-0 pr-2 ${bg} ${side === "left" ? "border-r border-bearing-border/30" : ""} ${""}`}
       >
         <pre className="whitespace-pre overflow-hidden text-ellipsis">
           {tokens ? (
@@ -1936,12 +2550,16 @@ function SplitHalf({
       </td>
     </>
   );
-}
+});
 
 function InlineCommentForm({
+  line,
+  startLine,
   onSubmit,
   onCancel,
 }: {
+  line: number;
+  startLine?: number;
   onSubmit: (body: string) => void;
   onCancel: () => void;
 }) {
@@ -1954,6 +2572,9 @@ function InlineCommentForm({
 
   return (
     <div className="mx-4 my-2 border border-bearing-accent/50 rounded-lg bg-bearing-surface p-3">
+      <div className="text-[10px] font-mono text-bearing-muted mb-1.5">
+        {startLine != null ? `L${startLine}–${line}` : `L${line}`}
+      </div>
       <textarea
         ref={textareaRef}
         value={body}

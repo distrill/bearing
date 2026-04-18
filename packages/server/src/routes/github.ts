@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import type { BearingConfig } from "../config.js";
-import { searchPRs, getSuggestedPRs, getViewer, getPRDetail, submitReview } from "../github.js";
+import { searchPRs, getSuggestedPRs, getViewer, getPRDetail, submitReview, mergePR, closePR, fetchUserRepos, fetchGitHubStats, makeDays } from "../github.js";
+import { fetchCompletedIssuesForStats } from "../linear.js";
 import { cached, invalidatePrefix } from "../cache.js";
 
 export async function githubRoutes(
@@ -85,7 +86,7 @@ export async function githubRoutes(
     const { body, event, comments } = request.body as {
       body: string;
       event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
-      comments?: Array<{ path: string; line: number; side: "LEFT" | "RIGHT"; body: string }>;
+      comments?: Array<{ path: string; line: number; start_line?: number; side: "LEFT" | "RIGHT"; body: string }>;
     };
 
     if (!["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(event)) {
@@ -103,6 +104,47 @@ export async function githubRoutes(
     );
 
     invalidatePrefix(`pr-detail:${owner}/${repo}#${number}`);
+
+    return { ok: true };
+  });
+
+  app.post("/api/prs/:owner/:repo/:number/merge", async (request, reply) => {
+    if (!config.github.token) {
+      return reply.code(503).send({ error: "GitHub token not configured" });
+    }
+
+    const { owner, repo, number } = request.params as {
+      owner: string;
+      repo: string;
+      number: string;
+    };
+    const { method, commitMessage } = request.body as { method: "merge" | "squash" | "rebase"; commitMessage?: string };
+
+    if (!["merge", "squash", "rebase"].includes(method)) {
+      return reply.code(400).send({ error: "Invalid merge method" });
+    }
+
+    await mergePR(config.github.token, owner, repo, parseInt(number, 10), method, commitMessage);
+    invalidatePrefix(`pr-detail:${owner}/${repo}#${number}`);
+    invalidatePrefix("prs:");
+
+    return { ok: true };
+  });
+
+  app.post("/api/prs/:owner/:repo/:number/close", async (request, reply) => {
+    if (!config.github.token) {
+      return reply.code(503).send({ error: "GitHub token not configured" });
+    }
+
+    const { owner, repo, number } = request.params as {
+      owner: string;
+      repo: string;
+      number: string;
+    };
+
+    await closePR(config.github.token, owner, repo, parseInt(number, 10));
+    invalidatePrefix(`pr-detail:${owner}/${repo}#${number}`);
+    invalidatePrefix("prs:");
 
     return { ok: true };
   });
@@ -145,5 +187,73 @@ export async function githubRoutes(
     }
 
     return cached("viewer", () => getViewer(config.github.token));
+  });
+
+  app.get("/api/repos", async (_request, reply) => {
+    if (!config.github.token) {
+      return reply.code(503).send({ error: "GitHub token not configured" });
+    }
+
+    const repos = await cached("repos", () => fetchUserRepos(config.github.token));
+    return { repos };
+  });
+
+  app.get("/api/stats", async (request, reply) => {
+    if (!config.github.token) {
+      return reply.code(503).send({ error: "GitHub token not configured" });
+    }
+
+    const { repos, teams } = request.query as { repos?: string; teams?: string };
+    const repoList = repos ? repos.split(",").filter(Boolean) : [];
+    const teamList = teams ? teams.split(",").filter(Boolean) : [];
+
+    if (repoList.length === 0 && teamList.length === 0) {
+      return {
+        days: [],
+        prsOpened: [],
+        prsMerged: [],
+        prsReviewed: [],
+        linesAuthored: [],
+        issuesClosed: [],
+      };
+    }
+
+    const cacheKey = `stats:${repoList.join(",")}:${teamList.join(",")}`;
+
+    return cached(cacheKey, async () => {
+      let ghStats = {
+        days: [] as string[],
+        prsOpened: [] as number[],
+        prsMerged: [] as number[],
+        prsReviewed: [] as number[],
+        linesAuthored: [] as number[],
+      };
+
+      if (repoList.length > 0) {
+        ghStats = await fetchGitHubStats(config.github.token, repoList);
+      }
+
+      let issuesClosed = new Array(14).fill(0);
+      const days = ghStats.days.length > 0 ? ghStats.days : makeDays(14);
+
+      if (teamList.length > 0 && config.linear.apiKeys.length > 0) {
+        const completed = await fetchCompletedIssuesForStats(config.linear.apiKeys, teamList);
+        const dayIndex = new Map(days.map((d: string, i: number) => [d, i]));
+        for (const issue of completed) {
+          const day = issue.completedAt.slice(0, 10);
+          const idx = dayIndex.get(day);
+          if (idx !== undefined) issuesClosed[idx]++;
+        }
+      }
+
+      return {
+        days,
+        prsOpened: ghStats.prsOpened.length > 0 ? ghStats.prsOpened : new Array(14).fill(0),
+        prsMerged: ghStats.prsMerged.length > 0 ? ghStats.prsMerged : new Array(14).fill(0),
+        prsReviewed: ghStats.prsReviewed.length > 0 ? ghStats.prsReviewed : new Array(14).fill(0),
+        linesAuthored: ghStats.linesAuthored.length > 0 ? ghStats.linesAuthored : new Array(14).fill(0),
+        issuesClosed,
+      };
+    });
   });
 }

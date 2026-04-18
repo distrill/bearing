@@ -3,6 +3,7 @@ import type { PullRequest, LinearIssue, LinearStatus } from "@bearing/shared";
 import {
   fetchPRs,
   fetchIssues,
+  fetchViewer,
   fetchTagAssignments,
   fetchWorkflowStates,
   updateIssueStatus,
@@ -71,9 +72,13 @@ function dedupeAndTag(
     }
   }
 
-  tagged.sort(
-    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-  );
+  const roleOrder: Record<PrRole, number> = { reviewer: 0, author: 1, suggested: 2 };
+  tagged.sort((a, b) => {
+    const ra = roleOrder[a.role];
+    const rb = roleOrder[b.role];
+    if (ra !== rb) return ra - rb;
+    return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  });
   return tagged;
 }
 
@@ -170,8 +175,17 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
   const [authoredPrs, setAuthoredPrs] = useState<PullRequest[]>([]);
   const [suggestedPrs, setSuggestedPrs] = useState<PullRequest[]>([]);
   const [issues, setIssues] = useState<LinearIssue[]>([]);
+  const [linearViewerIds, setLinearViewerIds] = useState<string[]>([]);
+  const [ghViewer, setGhViewer] = useState<string | null>(null);
   const [prsLoading, setPrsLoading] = useState(true);
   const [issuesLoading, setIssuesLoading] = useState(true);
+  const [pendingUpdate, setPendingUpdate] = useState<{
+    reviewPrs: PullRequest[];
+    authoredPrs: PullRequest[];
+    suggestedPrs: PullRequest[];
+    issues: LinearIssue[];
+    viewerIds: string[];
+  } | null>(null);
   const [assignments, setAssignments] = useState<TagAssignments>({
     prTags: [],
     issueTags: [],
@@ -179,6 +193,38 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
   const [filterTags, setFilterTags] = usePersistedSet("bearing:filterTags");
   const [untouchedOnly, setUntouchedOnly] = usePersistedBool("bearing:untouchedOnly", false);
   const { touch, needsAttention } = useLastTouched();
+
+  const prNeedsAttention = useCallback(
+    (pr: TaggedPullRequest) => {
+      if (!ghViewer) return false;
+      switch (pr.role) {
+        case "reviewer":
+          return pr.requestedReviewers.some(
+            (r) => r.login.toLowerCase() === ghViewer.toLowerCase(),
+          );
+        case "author":
+          return (
+            pr.reviewDecision !== null &&
+            pr.reviewDecision !== "REVIEW_REQUIRED"
+          );
+        case "suggested":
+          return pr.reviewDecision === "REVIEW_REQUIRED";
+        default:
+          return false;
+      }
+    },
+    [ghViewer],
+  );
+
+  const issueNeedsAttention = useCallback(
+    (issue: LinearIssue) => {
+      if (!needsAttention(issue.id, issue.updatedAt)) return false;
+      if (issue.lastActorId && linearViewerIds.includes(issue.lastActorId))
+        return false;
+      return true;
+    },
+    [needsAttention, linearViewerIds],
+  );
   const workflowStatesCache = useRef(new Map<string, LinearStatus[]>());
   const getWorkflowStates = useCallback(async (teamKey: string) => {
     const cached = workflowStatesCache.current.get(teamKey);
@@ -190,6 +236,7 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
 
   useEffect(() => {
     setPrsLoading(true);
+    setPendingUpdate(null);
     const isRefresh = refreshKey > 0;
     Promise.all([
       fetchPRs("review_requested", isRefresh)
@@ -204,19 +251,96 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
     ]).finally(() => setPrsLoading(false));
   }, [refreshKey]);
 
+
+
+
+
   useEffect(() => {
     const isRefresh = refreshKey > 0;
     setIssuesLoading(true);
     fetchIssues(isRefresh)
-      .then((r) => setIssues(r.issues))
+      .then((r) => {
+        setIssues(r.issues);
+        setLinearViewerIds(r.viewerIds);
+      })
       .catch(() => setIssues([]))
       .finally(() => setIssuesLoading(false));
   }, [refreshKey]);
+
+  // Background polling
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const [review, authored, suggested, issueData] = await Promise.all([
+          fetchPRs("review_requested").then((r) => r.prs).catch(() => null),
+          fetchPRs("authored").then((r) => r.prs).catch(() => null),
+          fetchPRs("suggested").then((r) => r.prs).catch(() => null),
+          fetchIssues().catch(() => null),
+        ]);
+
+        if (!review || !authored || !suggested || !issueData) return;
+
+        const fingerprint = (prs: PullRequest[]) =>
+          prs.map((p) => `${p.owner}/${p.repo}#${p.number}:${p.updatedAt}:${p.reviewDecision}`).join("|");
+        const issueFingerprint = (issues: LinearIssue[]) =>
+          issues.map((i) => `${i.id}:${i.updatedAt}:${i.status.id}`).join("|");
+
+        const changed =
+          fingerprint(review) !== fingerprint(reviewPrs) ||
+          fingerprint(authored) !== fingerprint(authoredPrs) ||
+          fingerprint(suggested) !== fingerprint(suggestedPrs) ||
+          issueFingerprint(issueData.issues) !== issueFingerprint(issues);
+
+        if (changed) {
+          setPendingUpdate({
+            reviewPrs: review,
+            authoredPrs: authored,
+            suggestedPrs: suggested,
+            issues: issueData.issues,
+            viewerIds: issueData.viewerIds,
+          });
+        }
+      } catch {
+        // ignore background fetch errors
+      }
+    }, 60_000);
+
+    return () => clearInterval(interval);
+  }, [reviewPrs, authoredPrs, suggestedPrs, issues]);
+
+  const applyPendingUpdate = useCallback(() => {
+    if (!pendingUpdate) return;
+    setReviewPrs(pendingUpdate.reviewPrs);
+    setAuthoredPrs(pendingUpdate.authoredPrs);
+    setSuggestedPrs(pendingUpdate.suggestedPrs);
+    setIssues(pendingUpdate.issues);
+    setLinearViewerIds(pendingUpdate.viewerIds);
+    setPendingUpdate(null);
+  }, [pendingUpdate]);
+
+  useEffect(() => {
+    if (pendingUpdate) {
+      window.dispatchEvent(new Event("bearing:updateAvailable"));
+    } else {
+      window.dispatchEvent(new Event("bearing:updateCleared"));
+    }
+  }, [pendingUpdate]);
+
+  useEffect(() => {
+    function handleApply() {
+      applyPendingUpdate();
+    }
+    window.addEventListener("bearing:applyUpdate", handleApply);
+    return () => window.removeEventListener("bearing:applyUpdate", handleApply);
+  }, [applyPendingUpdate]);
 
   useEffect(() => {
     fetchTagAssignments()
       .then(setAssignments)
       .catch(() => setAssignments({ prTags: [], issueTags: [] }));
+    fetchViewer()
+      .then((v) => setGhViewer(v.login))
+      .catch(() => {});
   }, []);
 
   const reloadAssignments = useCallback(() => {
@@ -346,7 +470,20 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
   filteredPrs = filteredPrs.filter((pr) => filterRepos.has(`${pr.owner}/${pr.repo}`));
   filteredPrs = filteredPrs.filter((pr) => filterPrStatuses.has(prStatus(pr)));
   if (untouchedOnly)
-    filteredPrs = filteredPrs.filter((pr) => needsAttention(prKey(pr), pr.updatedAt));
+    filteredPrs = filteredPrs.filter((pr) => prNeedsAttention(pr));
+  const roleOrder: Record<PrRole, number> = { reviewer: 0, author: 1, suggested: 2 };
+  filteredPrs.sort((a, b) => {
+    const aAttn = prNeedsAttention(a) ? 0 : 1;
+    const bAttn = prNeedsAttention(b) ? 0 : 1;
+    if (aAttn !== bAttn) return aAttn - bAttn;
+    const aTerminal = TERMINAL_PR_STATUSES.has(prStatus(a));
+    const bTerminal = TERMINAL_PR_STATUSES.has(prStatus(b));
+    if (aTerminal !== bTerminal) return aTerminal ? 1 : -1;
+    const ra = roleOrder[a.role];
+    const rb = roleOrder[b.role];
+    if (ra !== rb) return ra - rb;
+    return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  });
 
   let filteredIssues = issues;
   if (issueSearch) {
@@ -362,8 +499,11 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
   filteredIssues = filteredIssues.filter((i) => filterWorkspaces.has(i.workspace));
   filteredIssues = filteredIssues.filter((i) => filterStatuses.has(i.status.name));
   if (untouchedOnly)
-    filteredIssues = filteredIssues.filter((i) => needsAttention(i.id, i.updatedAt));
+    filteredIssues = filteredIssues.filter((i) => issueNeedsAttention(i));
   filteredIssues.sort((a, b) => {
+    const aAttn = issueNeedsAttention(a) ? 0 : 1;
+    const bAttn = issueNeedsAttention(b) ? 0 : 1;
+    if (aAttn !== bAttn) return aAttn - bAttn;
     const aTerminal = TERMINAL_TYPES.has(a.status.type);
     const bTerminal = TERMINAL_TYPES.has(b.status.type);
     if (aTerminal !== bTerminal) return aTerminal ? 1 : -1;
@@ -387,17 +527,13 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
                   else next.add(t.name);
                   setFilterTags(next);
                 }}
-                className="flex items-center gap-1 text-[10px] font-mono"
+                className="text-[10px] font-mono"
                 style={{
                   color: active ? t.color : undefined,
                   opacity: active ? 1 : 0.4,
                 }}
               >
-                <span
-                  className="w-1.5 h-1.5 rounded-full"
-                  style={{ backgroundColor: t.color }}
-                />
-                {t.name}
+                [{t.name}]
               </button>
             );
           })}
@@ -409,13 +545,12 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
                 else next.add("__untagged__");
                 setFilterTags(next);
               }}
-              className="flex items-center gap-1 text-[10px] font-mono"
+              className="text-[10px] font-mono"
               style={{
                 opacity: untaggedActive ? 1 : 0.4,
               }}
             >
-              <span className="w-1.5 h-1.5 rounded-full border border-bearing-muted" />
-              untagged
+              [untagged]
             </button>
           )}
           <span className="flex-1" />
@@ -423,7 +558,7 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
             onClick={() => setUntouchedOnly(!untouchedOnly)}
             className={`text-[10px] font-mono ${untouchedOnly ? "text-bearing-accent" : "text-bearing-muted"}`}
           >
-            needs attention
+            [needs attention]
           </button>
         </div>
       )}
@@ -474,7 +609,7 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
                     issue={issue}
                     tags={tags}
                     appliedTags={issueTagMap.get(issue.id) ?? []}
-                    attention={needsAttention(issue.id, issue.updatedAt)}
+                    attention={issueNeedsAttention(issue)}
                     onTouch={() => touch(issue.id)}
                     getWorkflowStates={getWorkflowStates}
                     onStatusChange={(newStatus) => {
@@ -534,7 +669,7 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
                   : "text-bearing-muted"
                   }`}
               >
-                suggested
+                [suggested]
               </button>
               {!prsLoading && (
                 <span className="text-xs font-mono text-bearing-muted">
@@ -556,7 +691,7 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
                     pr={pr}
                     tags={tags}
                     appliedTags={prTagMap.get(prKey(pr)) ?? []}
-                    attention={needsAttention(prKey(pr), pr.updatedAt)}
+                    attention={prNeedsAttention(pr)}
                     onTouch={() => touch(prKey(pr))}
                     onToggleTag={async (tagName) => {
                       const applied = prTagMap.get(prKey(pr)) ?? [];
@@ -599,7 +734,7 @@ function PrRow({
     <li className={`border-b border-bearing-border last:border-b-0 ${attention ? "border-l-2 border-l-bearing-accent" : ""}`}>
       <a
         href={`/review/${pr.owner}/${pr.repo}/${pr.number}`}
-        onClick={onTouch}
+        onMouseDown={onTouch}
         className="group/pr block px-4 py-3 hover:bg-bearing-surface/50 transition-colors"
       >
         <div className="flex items-center gap-2">
@@ -621,6 +756,7 @@ function PrRow({
                     key={t}
                     text={t}
                     color={def?.color ?? "#6e6a86"}
+                    onRemove={() => onToggleTag(t)}
                   />
                 );
               })}
@@ -657,15 +793,12 @@ function PrRow({
               <span className="text-bearing-cyan">+{pr.additions}</span>{" "}
               <span className="text-bearing-red">-{pr.deletions}</span>
             </span>
-            <a
-              href={pr.htmlUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              onClick={(e) => e.stopPropagation()}
+            <button
+              onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); onTouch(); window.open(pr.htmlUrl, "_blank"); }}
               className="opacity-0 group-hover/pr:opacity-100 transition-opacity hover:text-bearing-accent"
             >
-              github
-            </a>
+              [github]
+            </button>
           </div>
         </div>
       </a>
@@ -736,9 +869,9 @@ function IssueRow({
             </div>
             <div className="flex items-center gap-2 mt-1 text-xs font-mono text-bearing-muted">
               <span>{issue.identifier}</span>
-              <span>{issue.status.name}</span>
+              <ColorTag text={issue.status.name} color={issue.status.color} />
               {issue.priorityLabel !== "No priority" && (
-                <span>{issue.priorityLabel}</span>
+                <Tag text={issue.priorityLabel} />
               )}
               {appliedTags.map((t) => {
                 const def = tags.find((d) => d.name === t);
@@ -747,6 +880,7 @@ function IssueRow({
                     key={t}
                     text={t}
                     color={def?.color ?? "#6e6a86"}
+                    onRemove={() => onToggleTag(t)}
                   />
                 );
               })}
@@ -915,7 +1049,23 @@ function Tag({ text, variant }: { text: string; variant?: TagVariant }) {
   return <span className={`${base} ${style}`}>{text}</span>;
 }
 
-function ColorTag({ text, color }: { text: string; color: string }) {
+function ColorTag({ text, color, onRemove }: { text: string; color: string; onRemove?: () => void }) {
+  if (onRemove) {
+    return (
+      <span
+        className="group/tag shrink-0 inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono leading-none rounded border"
+        style={{ borderColor: `${color}50`, color }}
+      >
+        {text}
+        <button
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(); }}
+          className="hidden group-hover/tag:inline ml-1 hover:text-bearing-text"
+        >
+          ×
+        </button>
+      </span>
+    );
+  }
   return (
     <span
       className="shrink-0 px-1.5 py-0.5 text-[10px] font-mono leading-none rounded border"
@@ -998,7 +1148,7 @@ function MultiSelect({
         className={`text-xs font-mono leading-none hover:text-bearing-text ${selected.size > 0 ? "text-bearing-accent" : "text-bearing-muted"
           }`}
       >
-        [{label}{selected.size > 0 ? ` ${selected.size}/${options.length}` : ""}]
+        [{label}{selected.size > 0 ? ` ${options.filter(o => selected.has(o)).length}/${options.length}` : ""}]
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1 z-20 bg-bearing-surface border border-bearing-border rounded shadow-lg py-1 min-w-[180px]">

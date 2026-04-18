@@ -1,4 +1,4 @@
-import type { PullRequest, PullRequestFile, PullRequestReview, PullRequestCommit, ReviewComment, IssueComment, GitHubUser } from "./github.js";
+import type { PullRequest, PullRequestFile, PullRequestReview, PullRequestCommit, ReviewComment, IssueComment, GitHubUser, CheckRun } from "./github.js";
 import type { LinearIssue } from "./linear.js";
 
 // GET /api/prs?filter=review_requested|authored
@@ -9,6 +9,7 @@ export interface PullRequestsResponse {
 // GET /api/issues
 export interface LinearIssuesResponse {
   issues: LinearIssue[];
+  viewerIds: string[];
 }
 
 // GET /api/prs/:owner/:repo/:number/detail
@@ -32,6 +33,26 @@ export interface PRDetailResponse {
   comments: ReviewComment[];
   issueComments: IssueComment[];
   commits: PullRequestCommit[];
+  checkRuns: CheckRun[];
+  mergeable: boolean | null;
+  mergeableState: string;
+  allowedMergeMethods: ("merge" | "squash" | "rebase")[];
+  truncated: string[];
+}
+
+// GET /api/repos
+export interface ReposResponse {
+  repos: { owner: string; name: string; fullName: string }[];
+}
+
+// GET /api/stats
+export interface StatsResponse {
+  days: string[];
+  prsOpened: number[];
+  prsMerged: number[];
+  prsReviewed: number[];
+  linesAuthored: number[];
+  issuesClosed: number[];
 }
 
 // GET /api/health

@@ -40,11 +40,13 @@ export interface ReviewComment {
   body: string;
   path: string;
   line: number | null;
+  startLine: number | null;
   side: "LEFT" | "RIGHT";
   author: GitHubUser;
   createdAt: string;
   updatedAt: string;
   inReplyToId: number | null;
+  reviewId: number | null;
 }
 
 export interface PullRequestReview {
@@ -60,6 +62,14 @@ export interface PullRequestCommit {
   message: string;
   author: GitHubUser;
   committedAt: string;
+}
+
+export interface CheckRun {
+  id: number;
+  name: string;
+  status: "queued" | "in_progress" | "completed";
+  conclusion: "success" | "failure" | "neutral" | "cancelled" | "skipped" | "timed_out" | "action_required" | null;
+  htmlUrl: string;
 }
 
 export interface IssueComment {

@@ -2,8 +2,11 @@ import type { FastifyInstance } from "fastify";
 import type { BearingConfig } from "../config.js";
 import {
   fetchAllIssues,
+  fetchAllTeams,
   fetchWorkflowStates,
   updateIssueStatus,
+  createIssue,
+  fetchViewerId,
 } from "../linear.js";
 import { cached, invalidatePrefix } from "../cache.js";
 
@@ -22,10 +25,13 @@ export async function linearRoutes(
       invalidatePrefix("issues");
     }
 
-    const issues = await cached("issues", () =>
-      fetchAllIssues(config.linear.apiKeys),
-    );
-    return { issues };
+    const [issues, viewerIds] = await Promise.all([
+      cached("issues", () => fetchAllIssues(config.linear.apiKeys)),
+      cached("linear-viewer-ids", () =>
+        Promise.all(config.linear.apiKeys.map(fetchViewerId)),
+      ),
+    ]);
+    return { issues, viewerIds };
   });
 
   app.get("/api/issues/workflow-states/:teamKey", async (request, reply) => {
@@ -62,5 +68,34 @@ export async function linearRoutes(
     }
 
     return reply.code(500).send({ error: "Failed to update issue status" });
+  });
+
+  app.get("/api/teams", async (_request, reply) => {
+    if (!config.linear.apiKeys.length) {
+      return reply.code(503).send({ error: "No Linear API keys configured" });
+    }
+
+    const teams = await cached("teams", () =>
+      fetchAllTeams(config.linear.apiKeys),
+    );
+    return { teams };
+  });
+
+  app.post("/api/issues", async (request, reply) => {
+    const { teamId, title } = request.body as { teamId: string; title: string };
+
+    if (!config.linear.apiKeys.length) {
+      return reply.code(503).send({ error: "No Linear API keys configured" });
+    }
+
+    for (const apiKey of config.linear.apiKeys) {
+      try {
+        const issue = await createIssue(apiKey, teamId, title);
+        invalidatePrefix("issues");
+        return { issue };
+      } catch { /* try next key */ }
+    }
+
+    return reply.code(500).send({ error: "Failed to create issue" });
   });
 }

@@ -44,6 +44,15 @@ query($first: Int!) {
             color
           }
         }
+        history(first: 1) {
+          nodes {
+            actor {
+              ... on User {
+                id
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -109,6 +118,9 @@ interface RawIssue {
   labels: {
     nodes: Array<{ id: string; name: string; color: string }>;
   };
+  history: {
+    nodes: Array<{ actor: { id: string } | null }>;
+  };
 }
 
 interface AssignedIssuesResult {
@@ -139,6 +151,7 @@ function toLinearIssue(raw: RawIssue, workspace: string): LinearIssue {
     assignee: raw.assignee as LinearUser | null,
     labels: raw.labels.nodes,
     linkedPrNumber: null,
+    lastActorId: raw.history.nodes[0]?.actor?.id ?? null,
   };
 }
 
@@ -246,6 +259,161 @@ export async function updateIssueStatus(
     color: s.color,
     type: s.type as LinearStatus["type"],
   };
+}
+
+const TEAMS_QUERY = `
+query {
+  organization {
+    name
+  }
+  teams {
+    nodes {
+      id
+      name
+      key
+    }
+  }
+}
+`;
+
+interface TeamsResult {
+  organization: { name: string };
+  teams: { nodes: Array<{ id: string; name: string; key: string }> };
+}
+
+export interface LinearTeam {
+  id: string;
+  name: string;
+  key: string;
+  workspace: string;
+}
+
+export async function fetchTeams(apiKey: string): Promise<LinearTeam[]> {
+  const data = await graphql<TeamsResult>(apiKey, TEAMS_QUERY);
+  const workspace = data.organization.name;
+  return data.teams.nodes.map((t) => ({ ...t, workspace }));
+}
+
+export async function fetchAllTeams(apiKeys: string[]): Promise<LinearTeam[]> {
+  const results = await Promise.all(apiKeys.map(fetchTeams));
+  return results.flat();
+}
+
+const VIEWER_ID_QUERY = `
+query {
+  viewer {
+    id
+  }
+}
+`;
+
+interface CreateIssueResult {
+  issueCreate: {
+    success: boolean;
+    issue: RawIssue;
+  };
+}
+
+export async function createIssue(
+  apiKey: string,
+  teamId: string,
+  title: string,
+): Promise<LinearIssue> {
+  const viewerData = await graphql<{ viewer: { id: string } }>(apiKey, VIEWER_ID_QUERY);
+  const viewerId = viewerData.viewer.id;
+
+  const data = await graphql<CreateIssueResult>(
+    apiKey,
+    `mutation($teamId: String!, $title: String!, $assigneeId: String) {
+      issueCreate(input: { teamId: $teamId, title: $title, assigneeId: $assigneeId }) {
+        success
+        issue {
+          id
+          identifier
+          title
+          url
+          priority
+          priorityLabel
+          createdAt
+          updatedAt
+          state { id name color type }
+          team { name key }
+          assignee { id name displayName avatarUrl }
+          labels { nodes { id name color } }
+        }
+      }
+    }`,
+    { teamId, title, assigneeId: viewerId },
+  );
+
+  if (!data.issueCreate.success) {
+    throw new Error("Failed to create issue");
+  }
+
+  const orgData = await graphql<{ organization: { name: string } }>(
+    apiKey,
+    `query { organization { name } }`,
+  );
+
+  return toLinearIssue(data.issueCreate.issue, orgData.organization.name);
+}
+
+export async function fetchViewerId(apiKey: string): Promise<string> {
+  const data = await graphql<{ viewer: { id: string } }>(apiKey, VIEWER_ID_QUERY);
+  return data.viewer.id;
+}
+
+// --- Stats ---
+
+const COMPLETED_ISSUES_QUERY = `
+query($first: Int!, $after: DateTimeOrDuration!) {
+  issues(
+    first: $first
+    filter: {
+      assignee: { isMe: { eq: true } }
+      completedAt: { gte: $after }
+    }
+  ) {
+    nodes {
+      id
+      completedAt
+      team { key }
+    }
+  }
+}
+`;
+
+interface CompletedIssueRaw {
+  id: string;
+  completedAt: string;
+  team: { key: string };
+}
+
+interface CompletedIssuesResult {
+  issues: {
+    nodes: CompletedIssueRaw[];
+  };
+}
+
+export async function fetchCompletedIssuesForStats(
+  apiKeys: string[],
+  teamKeys: string[],
+): Promise<CompletedIssueRaw[]> {
+  const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  const teamSet = new Set(teamKeys);
+
+  const results = await Promise.all(
+    apiKeys.map(async (key) => {
+      const data = await graphql<CompletedIssuesResult>(
+        key,
+        COMPLETED_ISSUES_QUERY,
+        { first: 100, after: cutoff },
+      );
+      return data.issues.nodes;
+    }),
+  );
+
+  return results.flat().filter((i) => teamSet.has(i.team.key));
 }
 
 export async function fetchAllIssues(apiKeys: string[]): Promise<LinearIssue[]> {

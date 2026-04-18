@@ -14,6 +14,7 @@ export interface LinearIssue {
   teamKey: string;
   labels: LinearLabel[];
   linkedPrNumber: number | null;
+  lastActorId: string | null;
 }
 
 export interface LinearStatus {
@@ -34,6 +35,13 @@ export interface LinearLabel {
   id: string;
   name: string;
   color: string;
+}
+
+export interface LinearTeam {
+  id: string;
+  name: string;
+  key: string;
+  workspace: string;
 }
 
 export interface LinearComment {
