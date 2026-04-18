@@ -588,6 +588,12 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
                   options={workspaces}
                   selected={filterWorkspaces}
                   onChange={setFilterWorkspaces}
+                  linkFor={(ws) => {
+                    const issue = issues.find((i) => i.workspace === ws);
+                    if (!issue) return null;
+                    const match = issue.url.match(/^https:\/\/linear\.app\/([^/]+)/);
+                    return match ? `https://linear.app/${match[1]}` : null;
+                  }}
                 />
               )}
               {!issuesLoading && (
@@ -661,6 +667,7 @@ export function Dashboard({ refreshKey = 0, tags = [], issueSearch, prSearch, on
                   options={repos}
                   selected={filterRepos}
                   onChange={setFilterRepos}
+                  linkFor={(repo) => `https://github.com/${repo}`}
                 />
               )}
               <button
@@ -1123,12 +1130,14 @@ function MultiSelect({
   selected,
   onChange,
   colors,
+  linkFor,
 }: {
   label: string;
   options: string[];
   selected: Set<string>;
   onChange: (next: Set<string>) => void;
   colors?: Map<string, string>;
+  linkFor?: (opt: string) => string | null;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -1179,7 +1188,20 @@ function MultiSelect({
                     {active ? "●" : "○"}
                   </span>
                 )}
-                {opt}
+                <span className="flex-1">{opt}</span>
+                {linkFor?.(opt) && (
+                  <a
+                    href={linkFor(opt)!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className="text-bearing-muted/40 hover:text-bearing-text ml-1 shrink-0"
+                  >
+                    <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+                      <path d="M4.5 1.5H2a.5.5 0 0 0-.5.5v8a.5.5 0 0 0 .5.5h8a.5.5 0 0 0 .5-.5V7.5M7 1.5h3.5V5M6 6l4.5-4.5" />
+                    </svg>
+                  </a>
+                )}
               </button>
             );
           })}
